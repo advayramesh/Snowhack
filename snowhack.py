@@ -5,46 +5,6 @@ import os
 import yaml
 from hashlib import sha256
 
-# --- Helper Functions for Authentication ---
-CONFIG_FILE = "config.yaml"
-
-def load_config():
-    """Load configuration from a YAML file."""
-    try:
-        with open(CONFIG_FILE, "r") as file:
-            return yaml.safe_load(file)
-    except FileNotFoundError:
-        return {"users": {}}
-
-def save_config(config):
-    """Save configuration to a YAML file."""
-    with open(CONFIG_FILE, "w") as file:
-        yaml.dump(config, file)
-
-def hash_password(password):
-    """Hash a password for secure storage."""
-    return sha256(password.encode()).hexdigest()
-
-def authenticate(username, password):
-    """Authenticate a user by username and password."""
-    config = load_config()
-    users = config.get("users", {})
-    if username in users and users[username] == hash_password(password):
-        return True
-    return False
-
-def register_user(username, password):
-    """Register a new user."""
-    config = load_config()
-    users = config.get("users", {})
-    if username in users:
-        return False
-    users[username] = hash_password(password)
-    config["users"] = users
-    save_config(config)
-    return True
-
-# --- Snowflake Functions ---
 def init_snowflake_connection():
     """Initialize Snowflake connection with credentials"""
     try:
@@ -61,18 +21,46 @@ def init_snowflake_connection():
         st.error(f"Failed to connect to Snowflake: {str(e)}")
         return None
 
-def list_stages(conn):
-    """List all stages in the current schema"""
+def create_user_in_db(conn, username, password_hash):
+    """Create user in Snowflake database"""
     try:
         cursor = conn.cursor()
-        cursor.execute("SHOW STAGES")
-        stages = cursor.fetchall()
-        return stages
-    except ProgrammingError as e:
-        st.error(f"Error listing stages: {str(e)}")
-        return []
+        cursor.execute("""
+        INSERT INTO USERS (USERNAME, PASSWORD)
+        VALUES (%s, %s)
+        """, (username, password_hash))
+        return True
+    except Exception as e:
+        st.error(f"Error creating user in database: {str(e)}")
+        return False
     finally:
         cursor.close()
+
+def authenticate_user_in_db(conn, username, password_hash):
+    """Authenticate user from Snowflake database"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT USER_ID FROM USERS 
+        WHERE USERNAME = %s AND PASSWORD = %s
+        """, (username, password_hash))
+        result = cursor.fetchone()
+        return bool(result)
+    except Exception as e:
+        st.error(f"Error authenticating user: {str(e)}")
+        return False
+    finally:
+        cursor.close()
+
+def register_user(conn, username, password):
+    """Register a new user"""
+    password_hash = sha256(password.encode()).hexdigest()
+    return create_user_in_db(conn, username, password_hash)
+
+def authenticate(conn, username, password):
+    """Authenticate a user"""
+    password_hash = sha256(password.encode()).hexdigest()
+    return authenticate_user_in_db(conn, username, password_hash)
 
 def upload_files_to_stage(conn, stage_name, files):
     """Upload multiple files to a specific Snowflake stage"""
@@ -86,316 +74,211 @@ def upload_files_to_stage(conn, stage_name, files):
             with open(file_path, "wb") as f:
                 f.write(file.getbuffer())
             
-            # Use PUT command to upload the file to the stage
+            # Use PUT command to upload the file
             put_command = f"PUT 'file://{file_path}' @{stage_name} AUTO_COMPRESS=FALSE"
             cursor.execute(put_command)
             
-            # Add file to session state
-            if "uploaded_files" not in st.session_state:
-                st.session_state.uploaded_files = []
-            st.session_state.uploaded_files.append({
-                "name": file.name,
-                "stage": stage_name,
-                "path": f"@{stage_name}/{file.name}"
+            # Store metadata in database
+            cursor.execute("""
+            INSERT INTO UPLOADED_FILES_METADATA 
+            (USERNAME, SESSION_ID, STAGE_NAME, FILE_NAME)
+            VALUES (%s, %s, %s, %s)
+            """, (
+                st.session_state.username,
+                st.session_state.session_id,
+                stage_name,
+                file.name
+            ))
+            
+            uploaded_files.append({
+                'name': file.name,
+                'stage': stage_name,
+                'path': f"@{stage_name}/{file.name}"
             })
             
-            uploaded_files.append(file.name)
             st.success(f"✅ {file.name} uploaded successfully")
             
             # Clean up local file
             os.remove(file_path)
-        
-        except ProgrammingError as e:
+            
+        except Exception as e:
             st.error(f"❌ Error uploading {file.name}: {str(e)}")
         finally:
             cursor.close()
+    
+    if uploaded_files:
+        if 'uploaded_files' not in st.session_state:
+            st.session_state.uploaded_files = []
+        st.session_state.uploaded_files.extend(uploaded_files)
+    
     return uploaded_files
 
-def process_documents(conn, stage_name, file_path):
-    """Process a document using Snowflake Cortex"""
+def search_documents(conn, query, username):
+    """Search through documents using Cortex"""
     try:
         cursor = conn.cursor()
-        cursor.execute(f"""
-        SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
-            '@{stage_name}',
-            '{file_path}'
-        )
-        """)
-        result = cursor.fetchone()
-        return result[0] if result else None
-    except Exception as e:
-        st.error(f"Error processing document: {str(e)}")
-        return None
-    finally:
-        cursor.close()
-
-def extract_answer(conn, content, question):
-    """Extract answer using Snowflake Cortex"""
-    try:
-        cursor = conn.cursor()
+        
+        # Get file URLs for the user's uploaded documents
         cursor.execute("""
-        SELECT SNOWFLAKE.CORTEX.EXTRACT_ANSWER(%s, %s)
-        """, (content, question))
-        result = cursor.fetchone()
-        return result[0] if result else None
+        SELECT DISTINCT FILE_URL
+        FROM DOCS_CHUNKS_TABLE
+        WHERE USERNAME = %s
+        """, (username,))
+        
+        files = cursor.fetchall()
+        results = []
+        
+        for file in files:
+            file_url = file[0]
+            # Extract stage name and file path
+            stage_name, file_path = file_url[1:].split('/', 1)
+            
+            # Search in this document
+            cursor.execute("""
+            SELECT SNOWFLAKE.CORTEX.EXTRACT_ANSWER(
+                SNOWFLAKE.CORTEX.PARSE_DOCUMENT(%s, %s),
+                %s
+            )
+            """, (stage_name, file_path, query))
+            
+            answer = cursor.fetchone()
+            if answer and answer[0]:
+                results.append({
+                    'file': file_path,
+                    'answer': answer[0]
+                })
+        
+        return results
+        
     except Exception as e:
-        st.error(f"Error extracting answer: {str(e)}")
-        return None
+        st.error(f"Error searching documents: {str(e)}")
+        return []
     finally:
         cursor.close()
 
-# --- Main App ---
 def main():
     st.set_page_config(page_title="Document Q&A System", layout="wide")
+    
+    # Initialize connection
+    if 'snowflake_connection' not in st.session_state:
+        st.session_state.snowflake_connection = init_snowflake_connection()
+    
+    conn = st.session_state.snowflake_connection
+    if not conn:
+        st.error("Failed to connect to Snowflake")
+        return
+    
+    # Initialize session state
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
     
     # Custom CSS
     st.markdown("""
         <style>
         .block-container {
-            padding-top: 2rem;
-            padding-bottom: 2rem;
+            padding: 2rem;
         }
-        .stButton>button {
+        .stButton > button {
             width: 100%;
             background-color: #4CAF50;
             color: white;
-            border: none;
-            padding: 0.5rem 1rem;
+            padding: 0.5rem;
             border-radius: 0.3rem;
-        }
-        .stButton>button:hover {
-            background-color: #45a049;
+            border: none;
         }
         .auth-form {
-            background-color: #ffffff;
+            background-color: white;
             padding: 2rem;
             border-radius: 1rem;
             box-shadow: 0 0 10px rgba(0,0,0,0.1);
-            margin: 2rem auto;
-            max-width: 400px;
-        }
-        .success-message {
-            padding: 1rem;
-            border-radius: 0.5rem;
-            background-color: #d4edda;
-            color: #155724;
-            margin: 1rem 0;
-        }
-        .file-list {
-            margin: 1rem 0;
-            padding: 1rem;
-            border-radius: 0.5rem;
-            background-color: #f8f9fa;
-        }
-        .question-box {
-            background-color: #ffffff;
-            padding: 2rem;
-            border-radius: 1rem;
-            box-shadow: 0 0 10px rgba(0,0,0,0.1);
-            margin: 1rem 0;
-        }
-        .uploaded-file {
-            padding: 0.5rem;
-            background-color: #e9ecef;
-            border-radius: 0.3rem;
-            margin: 0.5rem 0;
-        }
-        .centered-tabs {
-            display: flex;
-            justify-content: center;
-            gap: 1rem;
-            margin-bottom: 2rem;
-        }
-        .tab-button {
-            padding: 0.5rem 2rem;
-            border: none;
-            background-color: #f8f9fa;
-            cursor: pointer;
-            border-radius: 0.3rem;
-        }
-        .tab-button.active {
-            background-color: #4CAF50;
-            color: white;
+            margin: 2rem 0;
         }
         </style>
     """, unsafe_allow_html=True)
     
     st.title("📚 Document Q&A System")
     
-    # Initialize session state
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-        st.session_state["show_signup"] = False
-    
     # Authentication
-    if not st.session_state["authenticated"]:
-        # Center the app title
-        st.markdown("<h1 style='text-align: center;'>📚 Document Q&A System</h1>", unsafe_allow_html=True)
+    if not st.session_state.authenticated:
+        tab1, tab2 = st.tabs(["Login", "Sign Up"])
         
-        # Add tabs for login/signup
-        col1, col2, col3 = st.columns([1,2,1])
-        with col2:
-            tab1, tab2 = st.tabs(["Login", "Sign Up"])
-            
-            with tab1:
-                st.markdown("<div class='auth-form'>", unsafe_allow_html=True)
+        with tab1:
+            with st.form("login_form"):
                 st.subheader("🔐 Login")
-                username = st.text_input("Username", key="login_username")
-                password = st.text_input("Password", type="password", key="login_password")
-                if st.button("Login", key="login_button"):
-                    if authenticate(username, password):
-                        st.session_state["authenticated"] = True
-                        st.session_state["username"] = username
-                        st.session_state["session_id"] = os.urandom(16).hex()
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button("Login")
+                
+                if submitted:
+                    if authenticate(conn, username, password):
+                        st.session_state.authenticated = True
+                        st.session_state.username = username
+                        st.session_state.session_id = os.urandom(16).hex()
                         st.success("✅ Login successful!")
                         st.rerun()
                     else:
                         st.error("❌ Invalid credentials")
-                st.markdown("</div>", unsafe_allow_html=True)
-            
-            with tab2:
-                st.markdown("<div class='auth-form'>", unsafe_allow_html=True)
+        
+        with tab2:
+            with st.form("signup_form"):
                 st.subheader("📝 Sign Up")
-                new_username = st.text_input("New Username", key="signup_username")
-                new_password = st.text_input("New Password", type="password", key="signup_password")
-                confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm")
-                if st.button("Sign Up", key="signup_button"):
+                new_username = st.text_input("New Username")
+                new_password = st.text_input("New Password", type="password")
+                confirm_password = st.text_input("Confirm Password", type="password")
+                submitted = st.form_submit_button("Sign Up")
+                
+                if submitted:
                     if new_password != confirm_password:
                         st.error("❌ Passwords do not match")
-                    elif register_user(new_username, new_password):
+                    elif register_user(conn, new_username, new_password):
                         st.success("✅ Registration successful! Please login.")
                     else:
                         st.error("❌ Username already exists")
-                st.markdown("</div>", unsafe_allow_html=True)
     
     else:
-        # Initialize Snowflake connection
-        if "snowflake_connection" not in st.session_state:
-            st.session_state.snowflake_connection = init_snowflake_connection()
-        
-        conn = st.session_state.snowflake_connection
-        
-        if conn:
-            # Sidebar for file upload
-            with st.sidebar:
-                st.markdown("### 👤 User Profile")
-                st.info(f"Logged in as: {st.session_state.username}")
-                st.markdown("---")
-                
-                st.markdown("### 📤 Upload Files")
-                stages = list_stages(conn)
-                
-                if stages:
-                    stage_names = [stage[1] for stage in stages]
-                    selected_stage = st.selectbox("Select Stage:", stage_names)
-                    
-                    uploaded_files = st.file_uploader(
-                        "Choose files to upload",
-                        accept_multiple_files=True,
-                        key="file_uploader"
-                    )
-                    
-                    if uploaded_files:
-                        with st.spinner("📤 Uploading files..."):
-                            successful_uploads = upload_files_to_stage(
-                                conn, selected_stage, uploaded_files
-                            )
-                
-                # Show uploaded files
-                if "uploaded_files" in st.session_state:
-                    st.markdown("### 📁 Your Uploaded Files")
-                    for file in st.session_state.uploaded_files:
-                        st.markdown(f"""
-                            <div class='uploaded-file'>
-                                📄 {file['name']}
-                            </div>
-                        """, unsafe_allow_html=True)
-                
-                st.markdown("---")
-                if st.button("🚪 Logout", key="logout"):
-                    st.session_state.clear()
-                    st.rerun()
+        # Main application
+        with st.sidebar:
+            st.markdown(f"### 👤 Welcome, {st.session_state.username}!")
+            st.divider()
             
-            # Main content area
-            st.markdown("## 🤖 Ask Questions About Your Documents")
+            # File upload section
+            st.subheader("📤 Upload Documents")
+            stage_name = "DOCS"  # Using fixed stage
             
-            # Display upload prompt if no files
-            if "uploaded_files" not in st.session_state or not st.session_state.uploaded_files:
-                st.warning("👈 Please upload some documents using the sidebar first!")
-            else:
-                st.markdown("""
-                    <div class='question-box'>
-                        <p>Ask any question about your uploaded documents:</p>
-                    </div>
-                """, unsafe_allow_html=True)
-                
-                question = st.text_area("Your Question:", height=100, 
-                                      placeholder="Enter your question here...")
-                
-                col1, col2, col3 = st.columns([1,2,1])
-                with col2:
-                    if st.button("🔍 Get Answer", use_container_width=True):
-                        if question:
-                            with st.spinner("🤔 Analyzing documents..."):
-                                all_content = []
-                                
-                                # Process each uploaded document
-                                for file in st.session_state.uploaded_files:
-                                    content = process_documents(
-                                        conn, file['stage'], file['name']
-                                    )
-                                    if content:
-                                        all_content.append(content)
-                                
-                                if all_content:
-                                    # Extract answer from all documents
-                                    combined_content = " ".join(all_content)
-                                    answer = extract_answer(conn, combined_content, question)
-                                    
-                                    if answer:
-                                        st.markdown("""
-                                            <div style='background-color: #f8f9fa; padding: 1rem; 
-                                                        border-radius: 0.5rem; margin-top: 1rem;'>
-                                                <h3 style='color: #4CAF50;'>💡 Answer</h3>
-                                                <p style='margin-top: 0.5rem;'>{}</p>
-                                            </div>
-                                        """.format(answer), unsafe_allow_html=True)
-                                    else:
-                                        st.info("🤔 No relevant answer found in the documents")
-                                else:
-                                    st.warning("⚠️ No document content available")
+            uploaded_files = st.file_uploader(
+                "Choose files to upload",
+                accept_multiple_files=True,
+                key="file_uploader"
+            )
+            
+            if uploaded_files:
+                with st.spinner("📤 Uploading files..."):
+                    upload_files_to_stage(conn, stage_name, uploaded_files)
+            
+            if st.button("🚪 Logout"):
+                st.session_state.clear()
+                st.rerun()
+        
+        # Main content
+        if 'uploaded_files' in st.session_state and st.session_state.uploaded_files:
+            st.subheader("🔍 Ask Questions")
+            question = st.text_area("Enter your question about the documents:")
+            
+            if st.button("Search", use_container_width=True):
+                if question:
+                    with st.spinner("🔍 Searching..."):
+                        results = search_documents(conn, question, st.session_state.username)
+                        
+                        if results:
+                            for result in results:
+                                with st.expander(f"Answer from {result['file']}"):
+                                    st.write(result['answer'])
                         else:
-                            st.warning("⚠️ Please enter a question first") in st.session_state:
-                        with st.spinner("🤔 Analyzing documents..."):
-                            all_content = []
-                            
-                            # Process each uploaded document
-                            for file in st.session_state.uploaded_files:
-                                content = process_documents(
-                                    conn, file['stage'], file['name']
-                                )
-                                if content:
-                                    all_content.append(content)
-                            
-                            if all_content:
-                                # Extract answer from all documents
-                                combined_content = " ".join(all_content)
-                                answer = extract_answer(conn, combined_content, question)
-                                
-                                if answer:
-                                    st.markdown("### 💡 Answer")
-                                    st.write(answer)
-                                else:
-                                    st.info("No relevant answer found in the documents")
-                            else:
-                                st.warning("No document content available")
-                    else:
-                        st.warning("Please upload some documents and ask a question")
-            
-            with col2:
-                st.subheader("📊 Session Info")
-                st.markdown(f"**User:** {st.session_state.username}")
-                st.markdown(f"**Files uploaded:** {len(st.session_state.uploaded_files) if 'uploaded_files' in st.session_state else 0}")
+                            st.info("No relevant answers found")
+                else:
+                    st.warning("Please enter a question")
+        else:
+            st.info("👈 Please upload some documents using the sidebar!")
 
 if __name__ == "__main__":
     main()
