@@ -59,17 +59,25 @@ def register_user(conn, username, password):
 def process_and_upload_file(conn, file, stage_name="DOCS"):
     """Process a file, upload to stage, and store chunks"""
     cursor = None
+    local_file_path = None
+    
     try:
         cursor = conn.cursor()
+        file_content = file.getvalue()
         
-        # First, save file locally for stage upload
-        file_path = f"./{file.name}"
-        with open(file_path, "wb") as f:
-            f.write(file.getvalue())
+        # Save file locally for stage upload
+        local_file_path = os.path.abspath(f"./{file.name}")
+        with open(local_file_path, "wb") as f:
+            f.write(file_content)
         
         # Upload to stage
-        put_command = f"PUT 'file://{file_path}' @{stage_name} AUTO_COMPRESS=FALSE"
-        cursor.execute(put_command)
+        try:
+            put_command = f"PUT file://{local_file_path} @{stage_name} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+            cursor.execute(put_command)
+            st.success(f"✅ {file.name} uploaded to stage")
+        except Exception as e:
+            st.error(f"Stage upload error for {file.name}: {str(e)}")
+            return False
         
         # Store metadata
         cursor.execute("""
@@ -87,40 +95,33 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
         ))
         
         # Process file content into chunks
-        file_content = file.getvalue()
-        if file.type and file.type.startswith('text/'):
-            try:
-                # Handle text files
-                text_content = file_content.decode('utf-8')
-                chunks = [text_content[i:i+1000] for i in range(0, len(text_content), 1000)]
-                
-                for chunk in chunks:
-                    cursor.execute("""
-                    INSERT INTO DOCS_CHUNKS_TABLE (
-                        RELATIVE_PATH,
-                        SIZE,
-                        FILE_URL,
-                        CHUNK,
-                        USERNAME,
-                        SESSION_ID
-                    ) VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (
-                        file.name,
-                        len(chunk.encode('utf-8')),
-                        f"@{stage_name}/{file.name}",
-                        chunk,
-                        st.session_state.username,
-                        st.session_state.session_id
-                    ))
-            except UnicodeDecodeError:
-                # If text decode fails, treat as binary
-                st.warning(f"Treating {file.name} as binary file")
-                process_binary_content(cursor, file_content, file.name, stage_name)
-        else:
-            # Handle binary files
-            process_binary_content(cursor, file_content, file.name, stage_name)
+        chunk_size = 8192  # 8KB chunks
+        total_chunks = (len(file_content) + chunk_size - 1) // chunk_size
         
-        st.success(f"Successfully processed {file.name}")
+        for i in range(total_chunks):
+            start_idx = i * chunk_size
+            end_idx = min(start_idx + chunk_size, len(file_content))
+            chunk = file_content[start_idx:end_idx]
+            
+            cursor.execute("""
+            INSERT INTO DOCS_CHUNKS_TABLE (
+                RELATIVE_PATH,
+                SIZE,
+                FILE_URL,
+                CHUNK,
+                USERNAME,
+                SESSION_ID
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                file.name,
+                len(chunk),
+                f"@{stage_name}/{file.name}",
+                chunk.hex(),
+                st.session_state.username,
+                st.session_state.session_id
+            ))
+        
+        st.success(f"✅ Created {total_chunks} chunks for {file.name}")
         return True
         
     except Exception as e:
@@ -129,8 +130,12 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
     finally:
         if cursor:
             cursor.close()
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # Clean up local file
+        if local_file_path and os.path.exists(local_file_path):
+            try:
+                os.remove(local_file_path)
+            except Exception as e:
+                st.warning(f"Could not remove temporary file: {str(e)}")
 
 def process_binary_content(cursor, content, filename, stage_name):
     """Process binary content into chunks"""
