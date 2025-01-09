@@ -116,163 +116,93 @@ def list_files_in_stage(conn, stage_name):
     finally:
         cursor.close()
 
-# --- Chunking Functions ---
-def chunk_and_store_file(conn, file, username, session_id, stage_name):
-    """
-    Chunk a file and store its metadata and chunks in the database.
-    Handles both text and binary files.
-    """
-    cursor = None
-    try:
-        # Determine file type and handle accordingly
-        file_extension = os.path.splitext(file.name)[1].lower()
-        
-        # Generate file URL and clean relative path
-        file_url = f"@{stage_name}/{file.name}"
-        relative_path = file.name
-        if relative_path.startswith('@'):
-            relative_path = relative_path.split('/', 1)[1] if '/' in relative_path else relative_path[1:]
-        
-        # Get file content
-        file_content = file.getvalue()
-        
-        cursor = conn.cursor()
-        
-        # Store file metadata
-        cursor.execute("""
-            INSERT INTO UPLOADED_FILES_METADATA (USERNAME, SESSION_ID, STAGE_NAME, FILE_NAME)
-            VALUES (%s, %s, %s, %s)
-        """, (username, session_id, stage_name, relative_path))
-        
-        # Calculate chunk size (8KB for binary files, 1000 chars for text)
-        CHUNK_SIZE = 8192  # 8KB chunks for binary files
-        
-        if file_extension in ['.txt', '.csv', '.md', '.py', '.js', '.html', '.css', '.json', '.xml', '.yaml', '.yml']:
-            try:
-                # Try to decode as text
-                content = file_content.decode('utf-8')
-                chunks = textwrap.wrap(content, width=1000, break_long_words=True, replace_whitespace=False)
-                
-                for chunk in chunks:
-                    cursor.execute("""
-                        INSERT INTO DOCS_CHUNKS_TABLE 
-                        (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (relative_path, len(chunk), file_url, chunk, username, session_id))
-            except UnicodeDecodeError:
-                # If decode fails, treat as binary
-                for i in range(0, len(file_content), CHUNK_SIZE):
-                    chunk = file_content[i:i + CHUNK_SIZE]
-                    cursor.execute("""
-                        INSERT INTO DOCS_CHUNKS_TABLE 
-                        (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (relative_path, len(chunk), file_url, chunk.hex(), username, session_id))
-        else:
-            # Handle as binary file
-            for i in range(0, len(file_content), CHUNK_SIZE):
-                chunk = file_content[i:i + CHUNK_SIZE]
-                cursor.execute("""
-                    INSERT INTO DOCS_CHUNKS_TABLE 
-                    (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """, (relative_path, len(chunk), file_url, chunk.hex(), username, session_id))
-        
-        st.success(f"Successfully chunked and stored {relative_path}")
-        
-    except Exception as e:
-        st.error(f"Error processing file {file.name}: {str(e)}")
-        if cursor:
-            cursor.close()
-        raise
-    else:
-        if cursor:
-            cursor.close()
-
-# --- Cortex Search Functions ---
-def setup_cortex_search(conn):
-    """Setup Cortex Search index and necessary configurations"""
+# --- Document Processing Setup ---
+def setup_document_processing(conn):
+    """Setup document processing capabilities"""
     try:
         cursor = conn.cursor()
         
-        # Create a Cortex Search index
+        # Initialize document processing
         cursor.execute("""
-        CREATE SEARCH INDEX IF NOT EXISTS docs_search_idx 
-        ON DOCS_CHUNKS_TABLE(CHUNK)
-        USING CORTEX;
+        CALL SYSTEM$INITIALIZE_DOCUMENT_PROCESSING();
         """)
         
-        # Add content type detection for better search
+        # Create document processing function
         cursor.execute("""
-        ALTER SEARCH INDEX docs_search_idx
-        SET AUTO_DETECT_CONTENT_TYPE = true;
+        CREATE OR REPLACE FUNCTION PROCESS_DOCUMENTS(stage_location STRING)
+        RETURNS TABLE(processed_documents VARIANT)
+        AS 'SELECT SYSTEM$PROCESS_DOCUMENTS(
+            stage_location,
+            OBJECT_CONSTRUCT(
+                ''mode'', ''single_document'',
+                ''granularity'', ''document'',
+                ''include_metadata'', true
+            )
+        )';
         """)
         
-        st.success("Cortex Search index setup complete")
+        st.success("Document processing setup complete")
     except Exception as e:
-        st.error(f"Error setting up Cortex Search: {str(e)}")
+        st.error(f"Error setting up document processing: {str(e)}")
     finally:
         cursor.close()
 
-def perform_search(conn, query, username=None, top_k=5):
+# --- Search and QA Functions ---
+def perform_vector_search(conn, stage_name, query, top_k=3):
     """
-    Perform semantic search using Cortex Search
+    Perform vector search on documents in stage
     """
     try:
         cursor = conn.cursor()
         
-        # Base search query
-        search_query = """
-        SELECT 
-            RELATIVE_PATH,
-            CHUNK,
-            SEARCH_SCORE,
-            FILE_URL
-        FROM DOCS_CHUNKS_TABLE
-        WHERE SEARCH_BY_CORTEX(
-            CHUNK,
-            %s,
-            TOP_K => %s
+        # Get vector embeddings for the query
+        cursor.execute("""
+        SELECT SYSTEM$GET_VECTORS_FROM_TEXT(
+            INPUT => %s,
+            MODEL_NAME => 'snowflake.snowflake_ml_embeddings'
         )
-        """
+        """, (query,))
         
-        # Add username filter if provided
-        params = [query, top_k]
-        if username:
-            search_query += " AND USERNAME = %s"
-            params.append(username)
-            
-        search_query += " ORDER BY SEARCH_SCORE DESC"
+        # Search documents
+        cursor.execute(f"""
+        SELECT *
+        FROM TABLE(CORTEX_DOCUMENTS_SEARCH(
+            '@{stage_name}',
+            SYSTEM$GET_VECTORS_FROM_TEXT(%s, 'snowflake.snowflake_ml_embeddings'),
+            TOP_N => %s
+        ));
+        """, (query, top_k))
         
-        cursor.execute(search_query, tuple(params))
         results = cursor.fetchall()
         return results
-        
     except Exception as e:
         st.error(f"Error performing search: {str(e)}")
         return []
     finally:
         cursor.close()
 
-def ask_question(conn, question, context_results):
+def generate_answer(conn, question, context):
     """
-    Use Mistral to generate an answer based on search results
+    Generate answer using Mistral
     """
     try:
         cursor = conn.cursor()
         
-        # Prepare context from search results
-        context = "\n".join([result[1] for result in context_results])
-        
-        # Use Mistral for question answering
+        prompt = f"""Based on the following context, please answer the question. If the context doesn't contain relevant information, say so.
+
+Context:
+{context}
+
+Question: {question}
+Answer:"""
+
         cursor.execute("""
         SELECT MISTRAL_GENERATE(
             prompt => %s,
-            context => %s,
-            max_tokens => 500,
-            temperature => 0.7
+            temperature => 0.7,
+            max_tokens => 500
         )
-        """, (question, context))
+        """, (prompt,))
         
         result = cursor.fetchone()
         return result[0] if result else None
@@ -282,61 +212,6 @@ def ask_question(conn, question, context_results):
         return None
     finally:
         cursor.close()
-
-# --- Streamlit UI Components ---
-def add_search_interface(conn):
-    """Add search interface to Streamlit app"""
-    st.subheader("Document Search")
-    
-    # Search input
-    search_query = st.text_input("Enter your search query:")
-    top_k = st.slider("Number of results", min_value=1, max_value=20, value=5)
-    
-    # Search scope
-    search_scope = st.radio(
-        "Search scope:",
-        ["My documents", "All documents"]
-    )
-    
-    if st.button("Search"):
-        if search_query:
-            username = st.session_state.username if search_scope == "My documents" else None
-            results = perform_search(conn, search_query, username, top_k)
-            
-            if results:
-                st.write(f"Found {len(results)} results:")
-                for result in results:
-                    with st.expander(f"Result from {result[0]} (Score: {result[2]:.2f})"):
-                        st.write("Content:", result[1])
-                        st.write("Source:", result[3])
-            else:
-                st.info("No results found")
-        else:
-            st.warning("Please enter a search query")
-
-def add_qa_interface(conn):
-    """Add question-answering interface to Streamlit app"""
-    st.subheader("Ask Questions About Your Documents")
-    
-    question = st.text_input("Ask a question about your documents:")
-    
-    if st.button("Get Answer"):
-        if question:
-            # First perform search to get relevant context
-            results = perform_search(conn, question, st.session_state.username, top_k=3)
-            
-            if results:
-                with st.spinner("Generating answer..."):
-                    answer = ask_question(conn, question, results)
-                    if answer:
-                        st.write("Answer:", answer)
-                        
-                        # Show sources
-                        with st.expander("View sources"):
-                            for result in results:
-                                st.write(f"- From {result[0]}")
-            else:
-                st.info("No relevant context found to answer the question")
 
 # --- Main App ---
 def main():
@@ -385,10 +260,10 @@ def main():
         
         conn = st.session_state.snowflake_connection
         
-        # Setup Cortex Search
-        if conn and "cortex_search_initialized" not in st.session_state:
-            setup_cortex_search(conn)
-            st.session_state.cortex_search_initialized = True
+        # Setup document processing
+        if conn and "doc_processing_initialized" not in st.session_state:
+            setup_document_processing(conn)
+            st.session_state.doc_processing_initialized = True
 
         if conn:
             # File Upload Section
@@ -408,109 +283,57 @@ def main():
                     
                     if uploaded_files:
                         st.write(f"Uploading {len(uploaded_files)} files to stage {selected_stage}...")
-
-                        # Upload files to stage
                         successful_uploads = upload_files_to_stage(conn, selected_stage, uploaded_files)
-                        
-                        # Process and chunk successful uploads
-                        for file in successful_uploads:
-                            chunk_and_store_file(
-                                conn=conn,
-                                file=file,
-                                username=st.session_state.username,
-                                session_id=st.session_state.session_id,
-                                stage_name=selected_stage
-                            )
                 
-                # Display files in stage
-                st.subheader(f"Files in {selected_stage}")
-                files = list_files_in_stage(conn, selected_stage)
-                
-                if files:
-                    file_data = []
-                    for file in files:
-                        file_data.append({
-                            "Name": file[0],
-                            "Size (bytes)": file[1],
-                            "Last Modified": file[2]
-                        })
-                    st.dataframe(file_data)
-                else:
-                    st.info("No files found in this stage.")
-
-            # Search and Q&A Functionality
-            if st.checkbox("Search and Ask Questions"):
-                st.subheader("Search and Q&A")
-                
-                # Query input
-                query = st.text_input("Enter your search query or question:")
-                
-                if st.button("Search and Answer"):
-                    if query:
-                        try:
-                            cursor = conn.cursor()
-                            
-                            # Search in stage files using Cortex Search
-                            cursor.execute("""
-                            SELECT SEARCH_BY_CORTEX(
-                                QUERY => %s,
-                                TARGET => '@""" + selected_stage + """',
-                                OPTIONS => OBJECT_CONSTRUCT(
-                                    'returnCount', 3,
-                                    'searchOptions', OBJECT_CONSTRUCT(
-                                        'includeFileMetadata', TRUE
-                                    )
-                                )
-                            )
-                            """, (query,))
-                            
-                            search_results = cursor.fetchone()[0]
-                            
-                            if search_results:
-                                # Display search results
-                                st.write("Found relevant documents:")
-                                for idx, result in enumerate(search_results['documents'], 1):
-                                    with st.expander(f"Result {idx} - {result['fileName']}"):
-                                        st.write("Relevance Score:", result['score'])
-                                        st.write("Content:", result['content'][:500] + "...")
-                                
-                                # Generate answer using Mistral
-                                context = "\n".join([doc['content'] for doc in search_results['documents']])
-                                
-                                prompt = f"""Based on the following context, please answer the question: {query}
-
-Context:
-{context}
-
-Question: {query}
-Answer:"""
-                                
-                                cursor.execute("""
-                                SELECT MISTRAL_GENERATE(
-                                    prompt => %s,
-                                    temperature => 0.7,
-                                    max_tokens => 500
-                                )
-                                """, (prompt,))
-                                
-                                answer = cursor.fetchone()[0]
-                                
-                                st.subheader("Answer:")
-                                st.write(answer)
-                                
-                                # Show sources
-                                st.subheader("Sources:")
-                                for doc in search_results['documents']:
-                                    st.write(f"- {doc['fileName']}")
-                            else:
-                                st.info("No relevant documents found")
-                            
-                        except Exception as e:
-                            st.error(f"Error during search and answer: {str(e)}")
-                        finally:
-                            cursor.close()
+                    # Display files in stage
+                    st.subheader(f"Files in {selected_stage}")
+                    files = list_files_in_stage(conn, selected_stage)
+                    
+                    if files:
+                        file_data = []
+                        for file in files:
+                            file_data.append({
+                                "Name": file[0],
+                                "Size (bytes)": file[1],
+                                "Last Modified": file[2]
+                            })
+                        st.dataframe(file_data)
                     else:
-                        st.warning("Please enter a query or question")
+                        st.info("No files found in this stage.")
+
+                    # Search and Q&A Interface
+                    if st.checkbox("Search and Ask Questions"):
+                        st.subheader("Search and Q&A")
+                        
+                        query = st.text_input("Enter your search query or question:")
+                        
+                        if st.button("Search and Answer"):
+                            if query:
+                                # Perform vector search
+                                search_results = perform_vector_search(conn, selected_stage, query)
+                                
+                                if search_results:
+                                    st.write("Found relevant documents:")
+                                    
+                                    # Display results and collect context
+                                    context = []
+                                    for idx, result in enumerate(search_results, 1):
+                                        with st.expander(f"Result {idx}"):
+                                            st.write("Score:", result[1])
+                                            content = result[2]
+                                            st.write("Content:", content[:500] + "...")
+                                            context.append(content)
+                                    
+                                    # Generate answer
+                                    with st.spinner("Generating answer..."):
+                                        answer = generate_answer(conn, query, "\n".join(context))
+                                        if answer:
+                                            st.subheader("Answer:")
+                                            st.write(answer)
+                                else:
+                                    st.info("No relevant documents found")
+                            else:
+                                st.warning("Please enter a query or question")
             
             # Logout button
             if st.sidebar.button("Logout"):
