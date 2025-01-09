@@ -4,8 +4,6 @@ from snowflake.connector.errors import ProgrammingError
 import os
 import yaml
 from hashlib import sha256
-from io import StringIO
-import textwrap
 
 # --- Helper Functions for Authentication ---
 CONFIG_FILE = "config.yaml"
@@ -40,7 +38,7 @@ def register_user(username, password):
     config = load_config()
     users = config.get("users", {})
     if username in users:
-        return False  # User already exists
+        return False
     users[username] = hash_password(password)
     config["users"] = users
     save_config(config)
@@ -88,170 +86,133 @@ def upload_files_to_stage(conn, stage_name, files):
             with open(file_path, "wb") as f:
                 f.write(file.getbuffer())
             
-            # Use PUT command to upload the file to the stage without compression
+            # Use PUT command to upload the file to the stage
             put_command = f"PUT 'file://{file_path}' @{stage_name} AUTO_COMPRESS=FALSE"
             cursor.execute(put_command)
-            st.success(f"File {file.name} successfully uploaded to stage {stage_name}.")
-            uploaded_files.append(file)
             
-            # Clean up local file after upload
+            # Add file to session state
+            if "uploaded_files" not in st.session_state:
+                st.session_state.uploaded_files = []
+            st.session_state.uploaded_files.append({
+                "name": file.name,
+                "stage": stage_name,
+                "path": f"@{stage_name}/{file.name}"
+            })
+            
+            uploaded_files.append(file.name)
+            st.success(f"✅ {file.name} uploaded successfully")
+            
+            # Clean up local file
             os.remove(file_path)
         
         except ProgrammingError as e:
-            st.error(f"Error uploading file {file.name} to stage {stage_name}: {str(e)}")
+            st.error(f"❌ Error uploading {file.name}: {str(e)}")
         finally:
             cursor.close()
     return uploaded_files
 
-def list_files_in_stage(conn, stage_name):
-    """List all files in a specific stage"""
+def process_documents(conn, stage_name, file_path):
+    """Process a document using Snowflake Cortex"""
     try:
         cursor = conn.cursor()
-        cursor.execute(f"LIST @{stage_name}")
-        files = cursor.fetchall()
-        return files
-    except ProgrammingError as e:
-        st.error(f"Error listing files in stage {stage_name}: {str(e)}")
-        return []
-    finally:
-        cursor.close()
-
-# --- Document Processing Setup ---
-def setup_document_processing(conn):
-    """Setup document processing capabilities"""
-    try:
-        cursor = conn.cursor()
-        
-        # Initialize document processing
-        cursor.execute("""
-        CALL SYSTEM$INITIALIZE_DOCUMENT_PROCESSING();
-        """)
-        
-        # Create document processing function
-        cursor.execute("""
-        CREATE OR REPLACE FUNCTION PROCESS_DOCUMENTS(stage_location STRING)
-        RETURNS TABLE(processed_documents VARIANT)
-        AS 'SELECT SYSTEM$PROCESS_DOCUMENTS(
-            stage_location,
-            OBJECT_CONSTRUCT(
-                ''mode'', ''single_document'',
-                ''granularity'', ''document'',
-                ''include_metadata'', true
-            )
-        )';
-        """)
-        
-        st.success("Document processing setup complete")
-    except Exception as e:
-        st.error(f"Error setting up document processing: {str(e)}")
-    finally:
-        cursor.close()
-
-# --- Search and QA Functions ---
-def perform_vector_search(conn, stage_name, query, top_k=3):
-    """
-    Perform vector search on documents in stage
-    """
-    try:
-        cursor = conn.cursor()
-        
-        # Get vector embeddings for the query
-        cursor.execute("""
-        SELECT SYSTEM$GET_VECTORS_FROM_TEXT(
-            INPUT => %s,
-            MODEL_NAME => 'snowflake.snowflake_ml_embeddings'
-        )
-        """, (query,))
-        
-        # Search documents
         cursor.execute(f"""
-        SELECT *
-        FROM TABLE(CORTEX_DOCUMENTS_SEARCH(
+        SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
             '@{stage_name}',
-            SYSTEM$GET_VECTORS_FROM_TEXT(%s, 'snowflake.snowflake_ml_embeddings'),
-            TOP_N => %s
-        ));
-        """, (query, top_k))
-        
-        results = cursor.fetchall()
-        return results
-    except Exception as e:
-        st.error(f"Error performing search: {str(e)}")
-        return []
-    finally:
-        cursor.close()
-
-def generate_answer(conn, question, context):
-    """
-    Generate answer using Mistral
-    """
-    try:
-        cursor = conn.cursor()
-        
-        prompt = f"""Based on the following context, please answer the question. If the context doesn't contain relevant information, say so.
-
-Context:
-{context}
-
-Question: {question}
-Answer:"""
-
-        cursor.execute("""
-        SELECT MISTRAL_GENERATE(
-            prompt => %s,
-            temperature => 0.7,
-            max_tokens => 500
+            '{file_path}',
+            {{'mode': 'plain_text'}}
         )
-        """, (prompt,))
-        
+        """)
         result = cursor.fetchone()
         return result[0] if result else None
-        
     except Exception as e:
-        st.error(f"Error generating answer: {str(e)}")
+        st.error(f"Error processing document: {str(e)}")
+        return None
+    finally:
+        cursor.close()
+
+def extract_answer(conn, content, question):
+    """Extract answer using Snowflake Cortex"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT SNOWFLAKE.CORTEX.EXTRACT_ANSWER(%s, %s)
+        """, (content, question))
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except Exception as e:
+        st.error(f"Error extracting answer: {str(e)}")
         return None
     finally:
         cursor.close()
 
 # --- Main App ---
 def main():
-    st.title("Document Search & QA System")
+    st.set_page_config(page_title="Document Q&A System", layout="wide")
+    
+    # Custom CSS
+    st.markdown("""
+        <style>
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+        .stButton>button {
+            width: 100%;
+        }
+        .success-message {
+            padding: 1rem;
+            border-radius: 0.5rem;
+            background-color: #d4edda;
+            color: #155724;
+            margin: 1rem 0;
+        }
+        .file-list {
+            margin: 1rem 0;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            background-color: #f8f9fa;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    st.title("📚 Document Q&A System")
     
     # Initialize session state
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
-
+    
     # Authentication
     if not st.session_state["authenticated"]:
-        auth_choice = st.sidebar.radio("Authentication", ["Login", "Sign Up"])
+        col1, col2 = st.columns(2)
         
-        if auth_choice == "Login":
-            st.subheader("Login")
+        with col1:
+            st.subheader("🔐 Login")
             username = st.text_input("Username", key="login_username")
             password = st.text_input("Password", type="password", key="login_password")
             
-            if st.button("Login"):
+            if st.button("Login", key="login_button"):
                 if authenticate(username, password):
                     st.session_state["authenticated"] = True
                     st.session_state["username"] = username
                     st.session_state["session_id"] = os.urandom(16).hex()
-                    st.success("Login successful!")
+                    st.success("✅ Login successful!")
                     st.rerun()
                 else:
-                    st.error("Invalid username or password.")
-        else:
-            st.subheader("Sign Up")
-            username = st.text_input("New Username", key="signup_username")
-            password = st.text_input("New Password", type="password", key="signup_password")
+                    st.error("❌ Invalid credentials")
+        
+        with col2:
+            st.subheader("📝 Sign Up")
+            new_username = st.text_input("New Username", key="signup_username")
+            new_password = st.text_input("New Password", type="password", key="signup_password")
             confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm")
             
-            if st.button("Sign Up"):
-                if password != confirm_password:
-                    st.error("Passwords do not match.")
-                elif register_user(username, password):
-                    st.success("User registered successfully! Please log in.")
+            if st.button("Sign Up", key="signup_button"):
+                if new_password != confirm_password:
+                    st.error("❌ Passwords do not match")
+                elif register_user(new_username, new_password):
+                    st.success("✅ Registration successful! Please login.")
                 else:
-                    st.error("Username already exists.")
+                    st.error("❌ Username already exists")
     
     else:
         # Initialize Snowflake connection
@@ -260,85 +221,77 @@ def main():
         
         conn = st.session_state.snowflake_connection
         
-        # Setup document processing
-        if conn and "doc_processing_initialized" not in st.session_state:
-            setup_document_processing(conn)
-            st.session_state.doc_processing_initialized = True
-
         if conn:
-            # File Upload Section
-            st.header("File Upload")
-            stages = list_stages(conn)
-            
-            if stages:
-                stage_names = [stage[1] for stage in stages]
-                selected_stage = st.selectbox("Select a stage to upload files:", stage_names)
+            # Sidebar for file upload
+            with st.sidebar:
+                st.subheader("📤 Upload Files")
+                stages = list_stages(conn)
                 
-                if selected_stage:
+                if stages:
+                    stage_names = [stage[1] for stage in stages]
+                    selected_stage = st.selectbox("Select Stage:", stage_names)
+                    
                     uploaded_files = st.file_uploader(
-                        "Choose files to upload", 
+                        "Choose files to upload",
                         accept_multiple_files=True,
                         key="file_uploader"
                     )
                     
                     if uploaded_files:
-                        st.write(f"Uploading {len(uploaded_files)} files to stage {selected_stage}...")
-                        successful_uploads = upload_files_to_stage(conn, selected_stage, uploaded_files)
+                        with st.spinner("📤 Uploading files..."):
+                            successful_uploads = upload_files_to_stage(
+                                conn, selected_stage, uploaded_files
+                            )
                 
-                    # Display files in stage
-                    st.subheader(f"Files in {selected_stage}")
-                    files = list_files_in_stage(conn, selected_stage)
-                    
-                    if files:
-                        file_data = []
-                        for file in files:
-                            file_data.append({
-                                "Name": file[0],
-                                "Size (bytes)": file[1],
-                                "Last Modified": file[2]
-                            })
-                        st.dataframe(file_data)
-                    else:
-                        st.info("No files found in this stage.")
-
-                    # Search and Q&A Interface
-                    if st.checkbox("Search and Ask Questions"):
-                        st.subheader("Search and Q&A")
-                        
-                        query = st.text_input("Enter your search query or question:")
-                        
-                        if st.button("Search and Answer"):
-                            if query:
-                                # Perform vector search
-                                search_results = perform_vector_search(conn, selected_stage, query)
-                                
-                                if search_results:
-                                    st.write("Found relevant documents:")
-                                    
-                                    # Display results and collect context
-                                    context = []
-                                    for idx, result in enumerate(search_results, 1):
-                                        with st.expander(f"Result {idx}"):
-                                            st.write("Score:", result[1])
-                                            content = result[2]
-                                            st.write("Content:", content[:500] + "...")
-                                            context.append(content)
-                                    
-                                    # Generate answer
-                                    with st.spinner("Generating answer..."):
-                                        answer = generate_answer(conn, query, "\n".join(context))
-                                        if answer:
-                                            st.subheader("Answer:")
-                                            st.write(answer)
-                                else:
-                                    st.info("No relevant documents found")
-                            else:
-                                st.warning("Please enter a query or question")
+                # Show uploaded files
+                if "uploaded_files" in st.session_state:
+                    st.subheader("📁 Your Files")
+                    for file in st.session_state.uploaded_files:
+                        st.markdown(f"- {file['name']}")
+                
+                if st.button("🚪 Logout"):
+                    st.session_state.clear()
+                    st.rerun()
             
-            # Logout button
-            if st.sidebar.button("Logout"):
-                st.session_state.clear()
-                st.rerun()
+            # Main content area
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.subheader("❓ Ask Questions")
+                question = st.text_area("Enter your question:", height=100)
+                
+                if st.button("🔍 Get Answer", use_container_width=True):
+                    if question and "uploaded_files" in st.session_state:
+                        with st.spinner("🤔 Analyzing documents..."):
+                            all_content = []
+                            
+                            # Process each uploaded document
+                            for file in st.session_state.uploaded_files:
+                                content = process_documents(
+                                    conn, file['stage'], file['name']
+                                )
+                                if content:
+                                    all_content.append(content)
+                            
+                            if all_content:
+                                # Extract answer from all documents
+                                combined_content = " ".join(all_content)
+                                answer = extract_answer(conn, combined_content, question)
+                                
+                                if answer:
+                                    st.markdown("### 💡 Answer")
+                                    st.write(answer)
+                                else:
+                                    st.info("No relevant answer found in the documents")
+                            else:
+                                st.warning("No document content available")
+                    else:
+                        st.warning("Please upload some documents and ask a question")
+            
+            with col2:
+                st.subheader("📊 Session Info")
+                st.markdown(f"**User:** {st.session_state.username}")
+                st.markdown(f"**Files uploaded:** {len(st.session_state.uploaded_files) if 'uploaded_files' in st.session_state else 0}")
 
 if __name__ == "__main__":
     main()
