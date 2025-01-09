@@ -203,7 +203,7 @@ def show_login():
             st.session_state["username"] = username
             st.session_state["session_id"] = os.urandom(16).hex()
             st.success("Login successful!")
-            st.experimental_rerun()
+            st.rerun()  # Updated from experimental_rerun()
         else:
             st.error("Invalid username or password.")
 
@@ -304,4 +304,4 @@ else:
         # Logout button
         if st.sidebar.button("Logout"):
             st.session_state.clear()
-            st.experimental_rerun()
+            st.rerun()  # Updated from experimental_rerun()
