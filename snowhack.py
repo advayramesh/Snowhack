@@ -120,16 +120,18 @@ def list_files_in_stage(conn, stage_name):
 def chunk_and_store_file(conn, file, username, session_id, stage_name):
     """
     Chunk a file and store its metadata and chunks in the database.
+    Handles both text and binary files.
     """
+    cursor = None
     try:
-        # Read file content
-        content = StringIO(file.getvalue().decode('utf-8')).read()
-        
-        # Create chunks (approximately 1000 characters each)
-        chunks = textwrap.wrap(content, width=1000, break_long_words=True, replace_whitespace=False)
+        # Determine file type and handle accordingly
+        file_extension = os.path.splitext(file.name)[1].lower()
         
         # Generate file URL
         file_url = f"@{stage_name}/{file.name}"
+        
+        # Get file content as bytes
+        file_content = file.getvalue()
         
         cursor = conn.cursor()
         
@@ -138,21 +140,51 @@ def chunk_and_store_file(conn, file, username, session_id, stage_name):
             INSERT INTO UPLOADED_FILES_METADATA (USERNAME, SESSION_ID, STAGE_NAME, FILE_NAME)
             VALUES (%s, %s, %s, %s)
         """, (username, session_id, stage_name, file.name))
+
+        # Calculate chunk size (8KB for binary files, 1000 chars for text)
+        CHUNK_SIZE = 8192  # 8KB chunks for binary files
         
-        # Store chunks
-        for chunk in chunks:
-            cursor.execute("""
-                INSERT INTO DOCS_CHUNKS_TABLE 
-                (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (file.name, len(chunk), file_url, chunk, username, session_id))
+        if file_extension in ['.txt', '.csv', '.md', '.py', '.js', '.html', '.css', '.json', '.xml', '.yaml', '.yml']:
+            try:
+                # Try to decode as text
+                content = file_content.decode('utf-8')
+                chunks = textwrap.wrap(content, width=1000, break_long_words=True, replace_whitespace=False)
+                
+                for chunk in chunks:
+                    cursor.execute("""
+                        INSERT INTO DOCS_CHUNKS_TABLE 
+                        (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (file.name, len(chunk), file_url, chunk, username, session_id))
+            except UnicodeDecodeError:
+                # If decode fails, treat as binary
+                for i in range(0, len(file_content), CHUNK_SIZE):
+                    chunk = file_content[i:i + CHUNK_SIZE]
+                    cursor.execute("""
+                        INSERT INTO DOCS_CHUNKS_TABLE 
+                        (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (file.name, len(chunk), file_url, chunk.hex(), username, session_id))
+        else:
+            # Handle as binary file
+            for i in range(0, len(file_content), CHUNK_SIZE):
+                chunk = file_content[i:i + CHUNK_SIZE]
+                cursor.execute("""
+                    INSERT INTO DOCS_CHUNKS_TABLE 
+                    (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (file.name, len(chunk), file_url, chunk.hex(), username, session_id))
         
         st.success(f"Successfully chunked and stored {file.name}")
         
     except Exception as e:
         st.error(f"Error processing file {file.name}: {str(e)}")
-    finally:
-        cursor.close()
+        if cursor:
+            cursor.close()
+        raise
+    else:
+        if cursor:
+            cursor.close()
 
 def get_stored_chunks(conn, username, session_id=None):
     """
@@ -296,7 +328,17 @@ else:
                         for chunk in chunks:
                             st.write(f"File: {chunk[0]}")
                             st.write(f"Size: {chunk[1]} bytes")
-                            st.write(f"Content preview: {chunk[3][:200]}...")
+                            
+                            # Check if content is hex-encoded binary data
+                            content = chunk[3]
+                            try:
+                                # Try to treat as text
+                                preview = content[:200]
+                                st.write(f"Content preview: {preview}...")
+                            except Exception:
+                                # If fails, show as binary
+                                st.write("Binary content (hex):", content[:100])
+                            
                             st.write("---")
                     else:
                         st.info("No chunks stored yet.")
