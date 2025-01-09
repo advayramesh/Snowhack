@@ -127,10 +127,13 @@ def chunk_and_store_file(conn, file, username, session_id, stage_name):
         # Determine file type and handle accordingly
         file_extension = os.path.splitext(file.name)[1].lower()
         
-        # Generate file URL
+        # Generate file URL and clean relative path
         file_url = f"@{stage_name}/{file.name}"
+        relative_path = file.name
+        if relative_path.startswith('@'):
+            relative_path = relative_path.split('/', 1)[1] if '/' in relative_path else relative_path[1:]
         
-        # Get file content as bytes
+        # Get file content
         file_content = file.getvalue()
         
         cursor = conn.cursor()
@@ -139,8 +142,8 @@ def chunk_and_store_file(conn, file, username, session_id, stage_name):
         cursor.execute("""
             INSERT INTO UPLOADED_FILES_METADATA (USERNAME, SESSION_ID, STAGE_NAME, FILE_NAME)
             VALUES (%s, %s, %s, %s)
-        """, (username, session_id, stage_name, file.name))
-
+        """, (username, session_id, stage_name, relative_path))
+        
         # Calculate chunk size (8KB for binary files, 1000 chars for text)
         CHUNK_SIZE = 8192  # 8KB chunks for binary files
         
@@ -155,7 +158,7 @@ def chunk_and_store_file(conn, file, username, session_id, stage_name):
                         INSERT INTO DOCS_CHUNKS_TABLE 
                         (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (file.name, len(chunk), file_url, chunk, username, session_id))
+                    """, (relative_path, len(chunk), file_url, chunk, username, session_id))
             except UnicodeDecodeError:
                 # If decode fails, treat as binary
                 for i in range(0, len(file_content), CHUNK_SIZE):
@@ -164,7 +167,7 @@ def chunk_and_store_file(conn, file, username, session_id, stage_name):
                         INSERT INTO DOCS_CHUNKS_TABLE 
                         (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (file.name, len(chunk), file_url, chunk.hex(), username, session_id))
+                    """, (relative_path, len(chunk), file_url, chunk.hex(), username, session_id))
         else:
             # Handle as binary file
             for i in range(0, len(file_content), CHUNK_SIZE):
@@ -173,9 +176,9 @@ def chunk_and_store_file(conn, file, username, session_id, stage_name):
                     INSERT INTO DOCS_CHUNKS_TABLE 
                     (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
                     VALUES (%s, %s, %s, %s, %s, %s)
-                """, (file.name, len(chunk), file_url, chunk.hex(), username, session_id))
+                """, (relative_path, len(chunk), file_url, chunk.hex(), username, session_id))
         
-        st.success(f"Successfully chunked and stored {file.name}")
+        st.success(f"Successfully chunked and stored {relative_path}")
         
     except Exception as e:
         st.error(f"Error processing file {file.name}: {str(e)}")
@@ -186,120 +189,238 @@ def chunk_and_store_file(conn, file, username, session_id, stage_name):
         if cursor:
             cursor.close()
 
-def get_stored_chunks(conn, username, session_id=None):
+# --- Cortex Search Functions ---
+def setup_cortex_search(conn):
+    """Setup Cortex Search index and necessary configurations"""
+    try:
+        cursor = conn.cursor()
+        
+        # Create a Cortex Search index
+        cursor.execute("""
+        CREATE SEARCH INDEX IF NOT EXISTS docs_search_idx 
+        ON DOCS_CHUNKS_TABLE(CHUNK)
+        USING CORTEX;
+        """)
+        
+        # Add content type detection for better search
+        cursor.execute("""
+        ALTER SEARCH INDEX docs_search_idx
+        SET AUTO_DETECT_CONTENT_TYPE = true;
+        """)
+        
+        st.success("Cortex Search index setup complete")
+    except Exception as e:
+        st.error(f"Error setting up Cortex Search: {str(e)}")
+    finally:
+        cursor.close()
+
+def perform_search(conn, query, username=None, top_k=5):
     """
-    Retrieve stored chunks for a user and optionally filtered by session_id.
+    Perform semantic search using Cortex Search
     """
     try:
         cursor = conn.cursor()
         
-        if session_id:
-            cursor.execute("""
-                SELECT RELATIVE_PATH, SIZE, FILE_URL, CHUNK, SESSION_ID
-                FROM DOCS_CHUNKS_TABLE
-                WHERE USERNAME = %s AND SESSION_ID = %s
-                ORDER BY RELATIVE_PATH
-            """, (username, session_id))
-        else:
-            cursor.execute("""
-                SELECT RELATIVE_PATH, SIZE, FILE_URL, CHUNK, SESSION_ID
-                FROM DOCS_CHUNKS_TABLE
-                WHERE USERNAME = %s
-                ORDER BY RELATIVE_PATH
-            """, (username,))
+        # Base search query
+        search_query = """
+        SELECT 
+            RELATIVE_PATH,
+            CHUNK,
+            SEARCH_SCORE,
+            FILE_URL
+        FROM DOCS_CHUNKS_TABLE
+        WHERE SEARCH_BY_CORTEX(
+            CHUNK,
+            %s,
+            TOP_K => %s
+        )
+        """
+        
+        # Add username filter if provided
+        params = [query, top_k]
+        if username:
+            search_query += " AND USERNAME = %s"
+            params.append(username)
             
-        return cursor.fetchall()
+        search_query += " ORDER BY SEARCH_SCORE DESC"
+        
+        cursor.execute(search_query, tuple(params))
+        results = cursor.fetchall()
+        return results
         
     except Exception as e:
-        st.error(f"Error retrieving chunks: {str(e)}")
+        st.error(f"Error performing search: {str(e)}")
         return []
     finally:
         cursor.close()
 
-# --- Streamlit App ---
-st.title("Snowflake Stage Explorer & Multi-File Uploader")
-
-# Initialize session state
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-
-def show_login():
-    """Display the login interface."""
-    st.subheader("Login")
-    username = st.text_input("Username", key="login_username")
-    password = st.text_input("Password", type="password", key="login_password")
-    
-    if st.button("Login"):
-        if authenticate(username, password):
-            st.session_state["authenticated"] = True
-            st.session_state["username"] = username
-            st.session_state["session_id"] = os.urandom(16).hex()
-            st.success("Login successful!")
-            st.rerun()  # Updated from experimental_rerun()
-        else:
-            st.error("Invalid username or password.")
-
-def show_signup():
-    """Display the signup interface."""
-    st.subheader("Sign Up")
-    username = st.text_input("New Username", key="signup_username")
-    password = st.text_input("New Password", type="password", key="signup_password")
-    confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm")
-    
-    if st.button("Sign Up"):
-        if password != confirm_password:
-            st.error("Passwords do not match.")
-        elif register_user(username, password):
-            st.success("User registered successfully! Please log in.")
-        else:
-            st.error("Username already exists.")
-
-# Main application logic
-if not st.session_state["authenticated"]:
-    auth_choice = st.sidebar.radio("Authentication", ["Login", "Sign Up"])
-    if auth_choice == "Login":
-        show_login()
-    else:
-        show_signup()
-else:
-    # Initialize Snowflake connection
-    if "snowflake_connection" not in st.session_state:
-        st.session_state.snowflake_connection = init_snowflake_connection()
-    
-    conn = st.session_state.snowflake_connection
-
-    if conn:
-        # List all stages
-        stages = list_stages(conn)
+def ask_question(conn, question, context_results):
+    """
+    Use Mistral to generate an answer based on search results
+    """
+    try:
+        cursor = conn.cursor()
         
-        if stages:
-            # Create a selection box for stages
-            stage_names = [stage[1] for stage in stages]
-            selected_stage = st.selectbox("Select a stage to upload files:", stage_names)
+        # Prepare context from search results
+        context = "\n".join([result[1] for result in context_results])
+        
+        # Use Mistral for question answering
+        cursor.execute("""
+        SELECT MISTRAL_GENERATE(
+            prompt => %s,
+            context => %s,
+            max_tokens => 500,
+            temperature => 0.7
+        )
+        """, (question, context))
+        
+        result = cursor.fetchone()
+        return result[0] if result else None
+        
+    except Exception as e:
+        st.error(f"Error generating answer: {str(e)}")
+        return None
+    finally:
+        cursor.close()
+
+# --- Streamlit UI Components ---
+def add_search_interface(conn):
+    """Add search interface to Streamlit app"""
+    st.subheader("Document Search")
+    
+    # Search input
+    search_query = st.text_input("Enter your search query:")
+    top_k = st.slider("Number of results", min_value=1, max_value=20, value=5)
+    
+    # Search scope
+    search_scope = st.radio(
+        "Search scope:",
+        ["My documents", "All documents"]
+    )
+    
+    if st.button("Search"):
+        if search_query:
+            username = st.session_state.username if search_scope == "My documents" else None
+            results = perform_search(conn, search_query, username, top_k)
             
-            if selected_stage:
-                # Multiple file uploader
-                uploaded_files = st.file_uploader(
-                    "Choose files to upload", 
-                    accept_multiple_files=True,
-                    key="file_uploader"
-                )
+            if results:
+                st.write(f"Found {len(results)} results:")
+                for result in results:
+                    with st.expander(f"Result from {result[0]} (Score: {result[2]:.2f})"):
+                        st.write("Content:", result[1])
+                        st.write("Source:", result[3])
+            else:
+                st.info("No results found")
+        else:
+            st.warning("Please enter a search query")
+
+def add_qa_interface(conn):
+    """Add question-answering interface to Streamlit app"""
+    st.subheader("Ask Questions About Your Documents")
+    
+    question = st.text_input("Ask a question about your documents:")
+    
+    if st.button("Get Answer"):
+        if question:
+            # First perform search to get relevant context
+            results = perform_search(conn, question, st.session_state.username, top_k=3)
+            
+            if results:
+                with st.spinner("Generating answer..."):
+                    answer = ask_question(conn, question, results)
+                    if answer:
+                        st.write("Answer:", answer)
+                        
+                        # Show sources
+                        with st.expander("View sources"):
+                            for result in results:
+                                st.write(f"- From {result[0]}")
+            else:
+                st.info("No relevant context found to answer the question")
+
+# --- Main App ---
+def main():
+    st.title("Document Search & QA System")
+    
+    # Initialize session state
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    # Authentication
+    if not st.session_state["authenticated"]:
+        auth_choice = st.sidebar.radio("Authentication", ["Login", "Sign Up"])
+        
+        if auth_choice == "Login":
+            st.subheader("Login")
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            
+            if st.button("Login"):
+                if authenticate(username, password):
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = username
+                    st.session_state["session_id"] = os.urandom(16).hex()
+                    st.success("Login successful!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+        else:
+            st.subheader("Sign Up")
+            username = st.text_input("New Username", key="signup_username")
+            password = st.text_input("New Password", type="password", key="signup_password")
+            confirm_password = st.text_input("Confirm Password", type="password", key="signup_confirm")
+            
+            if st.button("Sign Up"):
+                if password != confirm_password:
+                    st.error("Passwords do not match.")
+                elif register_user(username, password):
+                    st.success("User registered successfully! Please log in.")
+                else:
+                    st.error("Username already exists.")
+    
+    else:
+        # Initialize Snowflake connection
+        if "snowflake_connection" not in st.session_state:
+            st.session_state.snowflake_connection = init_snowflake_connection()
+        
+        conn = st.session_state.snowflake_connection
+        
+        # Setup Cortex Search
+        if conn and "cortex_search_initialized" not in st.session_state:
+            setup_cortex_search(conn)
+            st.session_state.cortex_search_initialized = True
+
+        if conn:
+            # File Upload Section
+            st.header("File Upload")
+            stages = list_stages(conn)
+            
+            if stages:
+                stage_names = [stage[1] for stage in stages]
+                selected_stage = st.selectbox("Select a stage to upload files:", stage_names)
                 
-                if uploaded_files:
-                    st.write(f"Uploading {len(uploaded_files)} files to stage {selected_stage}...")
+                if selected_stage:
+                    uploaded_files = st.file_uploader(
+                        "Choose files to upload", 
+                        accept_multiple_files=True,
+                        key="file_uploader"
+                    )
                     
-                    # Upload files to stage
-                    successful_uploads = upload_files_to_stage(conn, selected_stage, uploaded_files)
-                    
-                    # Process and chunk successful uploads
-                    for file in successful_uploads:
-                        chunk_and_store_file(
-                            conn=conn,
-                            file=file,
-                            username=st.session_state.username,
-                            session_id=st.session_state.session_id,
-                            stage_name=selected_stage
-                        )
+                    if uploaded_files:
+                        st.write(f"Uploading {len(uploaded_files)} files to stage {selected_stage}...")
+
+                        # Upload files to stage
+                        successful_uploads = upload_files_to_stage(conn, selected_stage, uploaded_files)
+                        
+                        # Process and chunk successful uploads
+                        for file in successful_uploads:
+                            chunk_and_store_file(
+                                conn=conn,
+                                file=file,
+                                username=st.session_state.username,
+                                session_id=st.session_state.session_id,
+                                stage_name=selected_stage
+                            )
                 
                 # Display files in stage
                 st.subheader(f"Files in {selected_stage}")
@@ -316,34 +437,85 @@ else:
                     st.dataframe(file_data)
                 else:
                     st.info("No files found in this stage.")
+
+            # Search and Q&A Functionality
+            if st.checkbox("Search and Ask Questions"):
+                st.subheader("Search and Q&A")
                 
-                # View stored chunks
-                if st.checkbox("View stored chunks"):
-                    chunks = get_stored_chunks(
-                        conn=conn,
-                        username=st.session_state.username
-                    )
-                    
-                    if chunks:
-                        for chunk in chunks:
-                            st.write(f"File: {chunk[0]}")
-                            st.write(f"Size: {chunk[1]} bytes")
+                # Query input
+                query = st.text_input("Enter your search query or question:")
+                
+                if st.button("Search and Answer"):
+                    if query:
+                        try:
+                            cursor = conn.cursor()
                             
-                            # Check if content is hex-encoded binary data
-                            content = chunk[3]
-                            try:
-                                # Try to treat as text
-                                preview = content[:200]
-                                st.write(f"Content preview: {preview}...")
-                            except Exception:
-                                # If fails, show as binary
-                                st.write("Binary content (hex):", content[:100])
+                            # Search in stage files using Cortex Search
+                            cursor.execute("""
+                            SELECT SEARCH_BY_CORTEX(
+                                QUERY => %s,
+                                TARGET => '@""" + selected_stage + """',
+                                OPTIONS => OBJECT_CONSTRUCT(
+                                    'returnCount', 3,
+                                    'searchOptions', OBJECT_CONSTRUCT(
+                                        'includeFileMetadata', TRUE
+                                    )
+                                )
+                            )
+                            """, (query,))
                             
-                            st.write("---")
+                            search_results = cursor.fetchone()[0]
+                            
+                            if search_results:
+                                # Display search results
+                                st.write("Found relevant documents:")
+                                for idx, result in enumerate(search_results['documents'], 1):
+                                    with st.expander(f"Result {idx} - {result['fileName']}"):
+                                        st.write("Relevance Score:", result['score'])
+                                        st.write("Content:", result['content'][:500] + "...")
+                                
+                                # Generate answer using Mistral
+                                context = "\n".join([doc['content'] for doc in search_results['documents']])
+                                
+                                prompt = f"""Based on the following context, please answer the question: {query}
+
+Context:
+{context}
+
+Question: {query}
+Answer:"""
+                                
+                                cursor.execute("""
+                                SELECT MISTRAL_GENERATE(
+                                    prompt => %s,
+                                    temperature => 0.7,
+                                    max_tokens => 500
+                                )
+                                """, (prompt,))
+                                
+                                answer = cursor.fetchone()[0]
+                                
+                                st.subheader("Answer:")
+                                st.write(answer)
+                                
+                                # Show sources
+                                st.subheader("Sources:")
+                                for doc in search_results['documents']:
+                                    st.write(f"- {doc['fileName']}")
+                            else:
+                                st.info("No relevant documents found")
+                            
+                        except Exception as e:
+                            st.error(f"Error during search and answer: {str(e)}")
+                        finally:
+                            cursor.close()
                     else:
-                        st.info("No chunks stored yet.")
-        
-        # Logout button
-        if st.sidebar.button("Logout"):
-            st.session_state.clear()
-            st.rerun()  # Updated from experimental_rerun()
+                        st.warning("Please enter a query or question")
+            
+            # Logout button
+            if st.sidebar.button("Logout"):
+                st.session_state.clear()
+                st.rerun()
+
+if __name__ == "__main__":
+    main()
