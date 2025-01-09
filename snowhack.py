@@ -1,198 +1,19 @@
-def search_documents(conn, query):
-    """Search documents using Cortex and show relevant chunks"""
-    try:
-        cursor = conn.cursor()
-        
-        # First get the documents and their chunks
-        cursor.execute("""
-        SELECT DISTINCT m.FILE_NAME 
-        FROM UPLOADED_FILES_METADATA m
-        WHERE m.USERNAME = %s
-        """, (st.session_state.username,))
-        
-        files = cursor.fetchall()
-        results = []
-        
-        for file in files:
-            filename = file[0]
-            
-            # Get the document content from stage
-            cursor.execute("""
-            SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
-                '@DOCS',
-                %s
-            )
-            """, (filename,))
-            
-            doc_content = cursor.fetchone()
-            if doc_content and doc_content[0]:
-                # Get answer
-                cursor.execute("""
-                SELECT SNOWFLAKE.CORTEX.EXTRACT_ANSWER(
-                    %s,
-                    %s
-                )
-                """, (doc_content[0], query))
-                
-                answer = cursor.fetchone()
-                if answer and answer[0]:
-                    # Get chunks for this file
-                    cursor.execute("""
-                    SELECT CHUNK 
-                    FROM DOCS_CHUNKS_TABLE 
-                    WHERE RELATIVE_PATH = %s 
-                    AND USERNAME = %s
-                    ORDER BY SIZE
-                    """, (filename, st.session_state.username))
-                    
-                    chunks = cursor.fetchall()
-                    chunk_texts = []
-                    
-                    for chunk in chunks:
-                        try:
-                            # Try to decode hex chunk
-                            chunk_content = bytes.fromhex(chunk[0]).decode('utf-8', errors='ignore')
-                            if any(char.isprintable() for char in chunk_content):
-                                chunk_texts.append(chunk_content)
-                        except (ValueError, TypeError):
-                            # If not hex, use as is
-                            if chunk[0] and isinstance(chunk[0], str):
-                                chunk_texts.append(chunk[0])
-                    
-                    results.append({
-                        'file': filename,
-                        'answer': answer[0],
-                        'chunks': chunk_texts
-                    })
-        
-        return results
-    except Exception as e:
-        st.error(f"Search error: {str(e)}")
-        return []
-    finally:
-        if cursor:
-            cursor.close()
-
-def main():
-    # ... (previous code remains the same until the search results display)
-    
-        if st.button("Search"):
-            if query:
-                with st.spinner("Searching..."):
-                    results = search_documents(conn, query)
-                    if results:
-                        for i, result in enumerate(results, 1):
-                            with st.expander(f"Result {i} from {result['file']}", expanded=True):
-                                st.markdown("### Question:")
-                                st.write(query)
-                                st.markdown("### Answer:")
-                                st.write(result['answer'])
-                                st.markdown("### Source Chunks:")
-                                for j, chunk in enumerate(result['chunks'], 1):
-                                    with st.expander(f"Chunk {j}"):
-                                        st.code(chunk[:1000], language=None)  # Show first 1000 chars of each chunk
-                    else:
-                        st.info("No relevant answers found")
-            else:
-                st.warning("Please enter a question")def process_and_upload_file(conn, file, stage_name="DOCS"):
-    """Process a file, upload to stage, and store chunks"""
-    cursor = None
-    temp_dir = "temp_uploads"
-    
-    try:
-        # Create temp directory if it doesn't exist
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        cursor = conn.cursor()
-        file_content = file.getvalue()
-        
-        # Save file locally for stage upload with escaped filename
-        safe_filename = file.name.replace(" ", "_")
-        local_file_path = os.path.join(temp_dir, safe_filename)
-        
-        with open(local_file_path, "wb") as f:
-            f.write(file_content)
-        
-        # Upload to stage using correct path format
-        try:
-            put_command = f"PUT 'file://{local_file_path}' @{stage_name} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
-            cursor.execute(put_command)
-            st.success(f"✅ {file.name} uploaded to stage")
-            
-            # Store metadata with original filename
-            cursor.execute("""
-            INSERT INTO UPLOADED_FILES_METADATA 
-            (USERNAME, SESSION_ID, STAGE_NAME, FILE_NAME)
-            VALUES (%s, %s, %s, %s)
-            """, (
-                st.session_state.username,
-                st.session_state.session_id,
-                stage_name,
-                file.name
-            ))
-            
-            # Process file content into chunks
-            chunk_size = 8192  # 8KB chunks
-            total_chunks = (len(file_content) + chunk_size - 1) // chunk_size
-            
-            for i in range(total_chunks):
-                start_idx = i * chunk_size
-                end_idx = min(start_idx + chunk_size, len(file_content))
-                chunk = file_content[start_idx:end_idx]
-                
-                cursor.execute("""
-                INSERT INTO DOCS_CHUNKS_TABLE 
-                (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """, (
-                    file.name,
-                    len(chunk),
-                    f"@{stage_name}/{safe_filename}",
-                    chunk.hex(),
-                    st.session_state.username,
-                    st.session_state.session_id
-                ))
-            
-            st.success(f"✅ Created {total_chunks} chunks for {file.name}")
-            
-        except Exception as e:
-            st.error(f"Stage upload error for {file.name}: {str(e)}")
-            return False
-            
-    except Exception as e:
-        st.error(f"Error processing {file.name}: {str(e)}")
-        return False
-    finally:
-        if cursor:
-            cursor.close()
-        # Clean up
-        try:
-            if os.path.exists(local_file_path):
-                os.remove(local_file_path)
-        except Exception:
-            passimport streamlit as st
+import streamlit as st
 import snowflake.connector
 from snowflake.connector.errors import ProgrammingError
 import os
-import yaml
 from hashlib import sha256
-from io import StringIO
 
 def init_snowflake_connection():
     """Initialize Snowflake connection"""
-    try:
-        conn = snowflake.connector.connect(
-            user='SNOWHACK10',
-            password='Snowhack10',
-            account='nrdbnwt-qob04556',
-            warehouse='COMPUTE_WH',
-            database='SAMPLEDATA',
-            schema='PUBLIC'
-        )
-        return conn
-    except Exception as e:
-        st.error(f"Failed to connect to Snowflake: {str(e)}")
-        return None
+    return snowflake.connector.connect(
+        user='SNOWHACK10',
+        password='Snowhack10',
+        account='nrdbnwt-qob04556',
+        warehouse='COMPUTE_WH',
+        database='SAMPLEDATA',
+        schema='PUBLIC'
+    )
 
 def authenticate(conn, username, password):
     """Authenticate user against Snowflake database"""
@@ -228,118 +49,122 @@ def register_user(conn, username, password):
     finally:
         cursor.close()
 
+def get_chunks_for_file(conn, filename, username):
+    """Retrieve all chunks for a specific file"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT CHUNK, SIZE
+        FROM DOCS_CHUNKS_TABLE 
+        WHERE RELATIVE_PATH = %s 
+        AND USERNAME = %s
+        ORDER BY SIZE
+        """, (filename, username))
+        return cursor.fetchall()
+    except Exception as e:
+        st.error(f"Error fetching chunks: {str(e)}")
+        return []
+    finally:
+        cursor.close()
+
 def process_and_upload_file(conn, file, stage_name="DOCS"):
     """Process a file, upload to stage, and store chunks"""
     cursor = None
     temp_dir = "temp_uploads"
+    local_file_path = None
     
     try:
         # Create temp directory if it doesn't exist
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
         
         cursor = conn.cursor()
         file_content = file.getvalue()
         
         # Save file locally for stage upload
-        local_file_path = os.path.join(os.getcwd(), temp_dir, file.name)
+        safe_filename = file.name.replace(" ", "_")
+        local_file_path = os.path.join(temp_dir, safe_filename)
+        
         with open(local_file_path, "wb") as f:
             f.write(file_content)
         
-        # Upload to stage using correct path format
+        # Upload to stage
         try:
-            put_command = "PUT 'file://" + local_file_path.replace("\\", "/") + f"' @{stage_name} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+            put_command = f"PUT 'file://{local_file_path}' @{stage_name} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
             cursor.execute(put_command)
             st.success(f"✅ {file.name} uploaded to stage")
+            
+            # Store metadata
+            cursor.execute("""
+            INSERT INTO UPLOADED_FILES_METADATA 
+            (USERNAME, SESSION_ID, STAGE_NAME, FILE_NAME)
+            VALUES (%s, %s, %s, %s)
+            """, (
+                st.session_state.username,
+                st.session_state.session_id,
+                stage_name,
+                file.name
+            ))
+            
+            # Process file content into chunks
+            chunk_size = 8192  # 8KB chunks
+            chunks_created = 0
+            
+            for i in range(0, len(file_content), chunk_size):
+                chunk = file_content[i:i + chunk_size]
+                
+                cursor.execute("""
+                INSERT INTO DOCS_CHUNKS_TABLE 
+                (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    file.name,
+                    len(chunk),
+                    f"@{stage_name}/{safe_filename}",
+                    chunk.hex(),
+                    st.session_state.username,
+                    st.session_state.session_id
+                ))
+                chunks_created += 1
+            
+            st.success(f"✅ Created {chunks_created} chunks for {file.name}")
+            
+            # Display chunks
+            st.write(f"### Chunks for {file.name}:")
+            chunks = get_chunks_for_file(conn, file.name, st.session_state.username)
+            
+            for idx, (chunk, size) in enumerate(chunks, 1):
+                with st.expander(f"Chunk {idx} (Size: {size} bytes)"):
+                    try:
+                        # Try to decode hex
+                        chunk_content = bytes.fromhex(chunk).decode('utf-8', errors='ignore')
+                        st.code(chunk_content[:200] + "..." if len(chunk_content) > 200 else chunk_content)
+                    except (ValueError, TypeError):
+                        st.code(f"Binary content: {chunk[:100]}...")
+            
+            return True
+            
         except Exception as e:
             st.error(f"Stage upload error for {file.name}: {str(e)}")
             return False
-        
-        # Store metadata
-        cursor.execute("""
-        INSERT INTO UPLOADED_FILES_METADATA (
-            USERNAME, 
-            SESSION_ID, 
-            STAGE_NAME, 
-            FILE_NAME
-        ) VALUES (%s, %s, %s, %s)
-        """, (
-            st.session_state.username,
-            st.session_state.session_id,
-            stage_name,
-            file.name
-        ))
-        
-        # Process file content into chunks
-        chunk_size = 8192  # 8KB chunks
-        total_chunks = (len(file_content) + chunk_size - 1) // chunk_size
-        
-        for i in range(total_chunks):
-            start_idx = i * chunk_size
-            end_idx = min(start_idx + chunk_size, len(file_content))
-            chunk = file_content[start_idx:end_idx]
             
-            cursor.execute("""
-            INSERT INTO DOCS_CHUNKS_TABLE (
-                RELATIVE_PATH,
-                SIZE,
-                FILE_URL,
-                CHUNK,
-                USERNAME,
-                SESSION_ID
-            ) VALUES (%s, %s, %s, %s, %s, %s)
-            """, (
-                file.name,
-                len(chunk),
-                f"@{stage_name}/{file.name}",
-                chunk.hex(),
-                st.session_state.username,
-                st.session_state.session_id
-            ))
-        
-        st.success(f"✅ Created {total_chunks} chunks for {file.name}")
-        return True
-        
     except Exception as e:
         st.error(f"Error processing {file.name}: {str(e)}")
         return False
     finally:
         if cursor:
             cursor.close()
-        # Clean up local file
-        if local_file_path and os.path.exists(local_file_path):
-            try:
+        try:
+            if local_file_path and os.path.exists(local_file_path):
                 os.remove(local_file_path)
-            except Exception as e:
-                st.warning(f"Could not remove temporary file: {str(e)}")
-
-def process_binary_content(cursor, content, filename, stage_name):
-    """Process binary content into chunks"""
-    chunk_size = 8192  # 8KB chunks
-    for i in range(0, len(content), chunk_size):
-        chunk = content[i:i+chunk_size]
-        cursor.execute("""
-        INSERT INTO DOCS_CHUNKS_TABLE (
-            RELATIVE_PATH,
-            SIZE,
-            FILE_URL,
-            CHUNK,
-            USERNAME,
-            SESSION_ID
-        ) VALUES (%s, %s, %s, %s, %s, %s)
-        """, (
-            filename,
-            len(chunk),
-            f"@{stage_name}/{filename}",
-            chunk.hex(),
-            st.session_state.username,
-            st.session_state.session_id
-        ))
+        except Exception:
+            pass
 
 def search_documents(conn, query):
     """Search documents using Cortex"""
     try:
         cursor = conn.cursor()
+        
+        # Get all documents for the user
         cursor.execute("""
         SELECT DISTINCT FILE_NAME 
         FROM UPLOADED_FILES_METADATA
@@ -351,6 +176,8 @@ def search_documents(conn, query):
         
         for file in files:
             filename = file[0]
+            
+            # Get document content
             cursor.execute("""
             SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
                 '@DOCS',
@@ -358,20 +185,39 @@ def search_documents(conn, query):
             )
             """, (filename,))
             
-            content = cursor.fetchone()
-            if content and content[0]:
+            doc_content = cursor.fetchone()
+            if doc_content and doc_content[0]:
+                # Get answer
                 cursor.execute("""
                 SELECT SNOWFLAKE.CORTEX.EXTRACT_ANSWER(
                     %s,
                     %s
                 )
-                """, (content[0], query))
+                """, (doc_content[0], query))
                 
                 answer = cursor.fetchone()
                 if answer and answer[0]:
+                    # Get associated chunks
+                    chunks = get_chunks_for_file(conn, filename, st.session_state.username)
+                    decoded_chunks = []
+                    
+                    for chunk, size in chunks:
+                        try:
+                            chunk_content = bytes.fromhex(chunk).decode('utf-8', errors='ignore')
+                            decoded_chunks.append({
+                                'content': chunk_content,
+                                'size': size
+                            })
+                        except (ValueError, TypeError):
+                            decoded_chunks.append({
+                                'content': f"Binary content: {chunk[:100]}...",
+                                'size': size
+                            })
+                    
                     results.append({
                         'file': filename,
-                        'answer': answer[0]
+                        'answer': answer[0],
+                        'chunks': decoded_chunks
                     })
         
         return results
@@ -379,7 +225,8 @@ def search_documents(conn, query):
         st.error(f"Search error: {str(e)}")
         return []
     finally:
-        cursor.close()
+        if cursor:
+            cursor.close()
 
 def main():
     st.set_page_config(page_title="Document Q&A System", layout="wide")
@@ -454,9 +301,16 @@ def main():
                 with st.spinner("Searching..."):
                     results = search_documents(conn, query)
                     if results:
-                        for result in results:
-                            with st.expander(f"Answer from {result['file']}", expanded=True):
+                        for i, result in enumerate(results, 1):
+                            with st.expander(f"Result {i} from {result['file']}", expanded=True):
+                                st.markdown("### Question:")
+                                st.write(query)
+                                st.markdown("### Answer:")
                                 st.write(result['answer'])
+                                st.markdown("### Source Chunks:")
+                                for j, chunk in enumerate(result['chunks'], 1):
+                                    with st.expander(f"Chunk {j} (Size: {chunk['size']} bytes)"):
+                                        st.code(chunk['content'])
                     else:
                         st.info("No relevant answers found")
             else:
