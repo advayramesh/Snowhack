@@ -118,41 +118,126 @@ def search_documents(conn, query, username):
     try:
         cursor = conn.cursor()
         
-        # Get file URLs for the user's uploaded documents
+        # Get recently uploaded files
         cursor.execute("""
-        SELECT DISTINCT FILE_URL
-        FROM DOCS_CHUNKS_TABLE
+        SELECT DISTINCT FILE_NAME, STAGE_NAME
+        FROM UPLOADED_FILES_METADATA
         WHERE USERNAME = %s
+        ORDER BY UPLOAD_TIME DESC
         """, (username,))
         
         files = cursor.fetchall()
         results = []
         
         for file in files:
-            file_url = file[0]
-            # Extract stage name and file path
-            stage_name, file_path = file_url[1:].split('/', 1)
+            file_name = file[0]
+            stage_name = file[1]
             
-            # Search in this document
-            cursor.execute("""
-            SELECT SNOWFLAKE.CORTEX.EXTRACT_ANSWER(
-                SNOWFLAKE.CORTEX.PARSE_DOCUMENT(%s, %s),
-                %s
-            )
-            """, (stage_name, file_path, query))
-            
-            answer = cursor.fetchone()
-            if answer and answer[0]:
-                results.append({
-                    'file': file_path,
-                    'answer': answer[0]
-                })
+            try:
+                # Get document content
+                cursor.execute("""
+                SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
+                    '@DOCS',
+                    %s
+                )
+                """, (file_name,))
+                
+                doc_content = cursor.fetchone()
+                
+                if doc_content and doc_content[0]:
+                    # Get answer
+                    cursor.execute("""
+                    SELECT SNOWFLAKE.CORTEX.EXTRACT_ANSWER(
+                        %s,
+                        %s
+                    )
+                    """, (doc_content[0], query))
+                    
+                    answer = cursor.fetchone()
+                    if answer and answer[0]:
+                        results.append({
+                            'file': file_name,
+                            'answer': answer[0]
+                        })
+            except Exception as e:
+                st.error(f"Error processing {file_name}: {str(e)}")
+                continue
         
         return results
         
     except Exception as e:
         st.error(f"Error searching documents: {str(e)}")
         return []
+    finally:
+        if cursor:
+            cursor.close()
+
+def save_chat_history(conn, username, question, answer, source_file):
+    """Save chat interaction to history"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO CHAT_HISTORY (
+            USERNAME, 
+            QUESTION, 
+            ANSWER, 
+            SOURCE_FILE, 
+            TIMESTAMP
+        ) VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP())
+        """, (username, question, answer, source_file))
+    except Exception as e:
+        st.error(f"Error saving chat history: {str(e)}")
+    finally:
+        cursor.close()
+
+def get_chat_history(conn, username):
+    """Get chat history for user"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT QUESTION, ANSWER, SOURCE_FILE, TIMESTAMP
+        FROM CHAT_HISTORY
+        WHERE USERNAME = %s
+        ORDER BY TIMESTAMP DESC
+        """, (username,))
+        return cursor.fetchall()
+    except Exception as e:
+        st.error(f"Error fetching chat history: {str(e)}")
+        return []
+    finally:
+        cursor.close()
+
+# Add this function to create required tables
+def setup_database(conn):
+    """Setup required database tables"""
+    try:
+        cursor = conn.cursor()
+        
+        # Create CHAT_HISTORY table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS CHAT_HISTORY (
+            ID NUMBER AUTOINCREMENT,
+            USERNAME VARCHAR(255),
+            QUESTION TEXT,
+            ANSWER TEXT,
+            SOURCE_FILE VARCHAR(255),
+            TIMESTAMP TIMESTAMP_NTZ,
+            PRIMARY KEY (ID)
+        )
+        """)
+        
+        # Create USERS table if not exists
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS USERS (
+            USER_ID NUMBER AUTOINCREMENT,
+            USERNAME VARCHAR(255) NOT NULL UNIQUE,
+            PASSWORD VARCHAR(255) NOT NULL,
+            PRIMARY KEY (USER_ID)
+        )
+        """)
+        
+    except Exception as e:
+        st.error(f"Error setting up database: {str(e)}")
     finally:
         cursor.close()
 
