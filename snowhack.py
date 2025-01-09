@@ -59,20 +59,24 @@ def register_user(conn, username, password):
 def process_and_upload_file(conn, file, stage_name="DOCS"):
     """Process a file, upload to stage, and store chunks"""
     cursor = None
-    local_file_path = None
+    temp_dir = "temp_uploads"
     
     try:
+        # Create temp directory if it doesn't exist
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+        
         cursor = conn.cursor()
         file_content = file.getvalue()
         
         # Save file locally for stage upload
-        local_file_path = os.path.abspath(f"./{file.name}")
+        local_file_path = os.path.join(os.getcwd(), temp_dir, file.name)
         with open(local_file_path, "wb") as f:
             f.write(file_content)
         
-        # Upload to stage
+        # Upload to stage using correct path format
         try:
-            put_command = f"PUT file://{local_file_path} @{stage_name} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+            put_command = "PUT 'file://" + local_file_path.replace("\\", "/") + f"' @{stage_name} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
             cursor.execute(put_command)
             st.success(f"✅ {file.name} uploaded to stage")
         except Exception as e:
