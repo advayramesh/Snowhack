@@ -3,7 +3,7 @@ import snowflake.connector
 from snowflake.connector.errors import ProgrammingError
 import os
 from hashlib import sha256
-import pypdf
+from pypdf import PdfReader
 import io
 
 def init_snowflake_connection():
@@ -55,7 +55,7 @@ def extract_text_from_pdf(file_content):
     """Extract text content from PDF file"""
     try:
         pdf_file = io.BytesIO(file_content)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        pdf_reader = PdfReader(pdf_file)
         text_content = ""
         
         for page in pdf_reader.pages:
