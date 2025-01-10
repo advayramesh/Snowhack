@@ -266,7 +266,7 @@ def search_documents(conn, query):
     try:
         cursor = conn.cursor()
         
-        # Use correct Snowflake syntax for search
+        # Use consistent parameter binding with %s
         cursor.execute("""
         SELECT 
             chunk,
@@ -275,17 +275,23 @@ def search_documents(conn, query):
             SNOWFLAKE.CORTEX.SEARCH_RELEVANCE(chunk) as relevance
         FROM SNOWFLAKE.CORTEX.SEARCH(
             'SAMPLEDATA.PUBLIC.docs_search_svc',
-            :1,
+            %s,
             OBJECT_CONSTRUCT(
-                'username', :2,
-                'session_id', :3
+                'username', %s,
+                'session_id', %s
             )
         )
-        WHERE username = :2 
-        AND session_id = :3
+        WHERE username = %s 
+        AND session_id = %s
         ORDER BY relevance DESC
         LIMIT 3
-        """, (query, st.session_state.username, st.session_state.session_id))
+        """, (
+            query, 
+            st.session_state.username, 
+            st.session_state.session_id,
+            st.session_state.username,
+            st.session_state.session_id
+        ))
         
         results = cursor.fetchall()
         
