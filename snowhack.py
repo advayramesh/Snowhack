@@ -262,24 +262,28 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Retrieve relevant documents using Snowflake Cortex Search"""
+    """Search documents using text matching"""
     try:
         cursor = conn.cursor()
+        
+        # Execute basic text search
         cursor.execute("""
-        SELECT 
-            chunk,
-            relative_path as file_name,
-            size,
-            snowflake.cortex.complete(
-                'mistral-large-latest',
-                'Rate the semantic similarity between 0 and 1 for this query: ' || %s || ' and this text: ' || chunk || '. Return only the number.'
-            ) as similarity_score
-        FROM SAMPLEDATA.PUBLIC.DOCS_CHUNKS_TABLE
-        WHERE username = %s 
-        AND session_id = %s
-        QUALIFY ROW_NUMBER() OVER (ORDER BY CAST(REGEXP_SUBSTR(similarity_score, '[0-9]*\.?[0-9]+') AS FLOAT) DESC) <= 3
-        ORDER BY CAST(REGEXP_SUBSTR(similarity_score, '[0-9]*\.?[0-9]+') AS FLOAT) DESC
-        """, (query, st.session_state.username, st.session_state.session_id))
+        WITH ranked_results AS (
+            SELECT 
+                chunk,
+                relative_path as file_name,
+                size,
+                CONTAINS(LOWER(chunk), LOWER(%s)) as exact_match
+            FROM SAMPLEDATA.PUBLIC.DOCS_CHUNKS_TABLE
+            WHERE username = %s 
+            AND session_id = %s
+            AND CONTAINS(LOWER(chunk), LOWER(%s))
+            QUALIFY ROW_NUMBER() OVER (ORDER BY exact_match DESC, size DESC) <= 3
+        )
+        SELECT *
+        FROM ranked_results
+        ORDER BY exact_match DESC, size DESC
+        """, (query, st.session_state.username, st.session_state.session_id, query))
         
         return cursor.fetchall()
     finally:
@@ -287,34 +291,16 @@ def search_documents(conn, query):
             cursor.close()
 
 def generate_response(conn, query, context_chunks):
-    """Generate response using Mistral LLM with retrieved context"""
+    """Generate response using basic text concatenation"""
     try:
-        cursor = conn.cursor()
-        
         # Combine context chunks
         context = "\n\n".join([chunk[0] for chunk in context_chunks])
         
-        # Generate response using Mistral
-        cursor.execute("""
-        SELECT snowflake.cortex.complete(
-            'mistral-large-latest',
-            'You are a helpful assistant. Use the following context to answer the question. 
-            If you cannot answer based on the context, say so.
-            
-            Context:
-            ' || %s || '
-            
-            Question: ' || %s || '
-            
-            Answer: '
-        ) as response
-        """, (context, query))
-        
-        result = cursor.fetchone()
-        return result[0] if result else "Sorry, I couldn't generate a response."
-    finally:
-        if cursor:
-            cursor.close()
+        # For now, return a simple response
+        return f"Found {len(context_chunks)} relevant documents. Here are the key excerpts:\n\n{context}"
+    except Exception as e:
+        st.error(f"Error generating response: {str(e)}")
+        return "Sorry, I couldn't generate a response."
 
 def main():
     st.set_page_config(page_title="Document Search & QA System", layout="wide")
