@@ -1,4 +1,108 @@
-import streamlit as st
+def process_and_upload_file(conn, file, stage_name="DOCS"):
+    """Process a file, upload to stage, and store chunks"""
+    cursor = None
+    temp_dir = "temp_uploads"
+    local_file_path = None
+    
+    try:
+        # Create temp directory if it doesn't exist
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        cursor = conn.cursor()
+        
+        # Save file locally for stage upload
+        safe_filename = file.name.replace(" ", "_")
+        local_file_path = os.path.join(temp_dir, safe_filename)
+        
+        with open(local_file_path, "wb") as f:
+            f.write(file.getvalue())
+        
+        # Upload to stage
+        try:
+            put_command = f"PUT 'file://{local_file_path}' @{stage_name} AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
+            cursor.execute(put_command)
+            st.success(f"✅ {file.name} uploaded to stage")
+            
+            # Parse document using Cortex
+            cursor.execute("""
+            SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
+                %s,
+                %s,
+                { 'mode': 'OCR' }
+            )
+            """, (f"@{stage_name}", safe_filename))
+            
+            parsed_content = cursor.fetchone()
+            if parsed_content and parsed_content[0]:
+                content = parsed_content[0].get('content', '')
+                
+                # Store metadata
+                cursor.execute("""
+                INSERT INTO UPLOADED_FILES_METADATA 
+                (USERNAME, SESSION_ID, STAGE_NAME, FILE_NAME)
+                VALUES (%s, %s, %s, %s)
+                """, (
+                    st.session_state.username,
+                    st.session_state.session_id,
+                    stage_name,
+                    file.name
+                ))
+                
+                # Process content into chunks
+                chunk_size = 8192  # 8KB chunks
+                chunks_created = 0
+                
+                for i in range(0, len(content), chunk_size):
+                    chunk = content[i:i + chunk_size]
+                    cursor.execute("""
+                    INSERT INTO DOCS_CHUNKS_TABLE 
+                    (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        file.name,
+                        len(chunk),
+                        f"@{stage_name}/{safe_filename}",
+                        chunk,
+                        st.session_state.username,
+                        st.session_state.session_id
+                    ))
+                    chunks_created += 1
+                
+                st.success(f"✅ Created {chunks_created} chunks for {file.name}")
+                
+                # Display extracted content
+                st.markdown("### Extracted Content:")
+                st.write(content[:1000] + "..." if len(content) > 1000 else content)
+                
+                # Display chunks in a table instead of nested expanders
+                st.markdown("### Chunks:")
+                chunks_data = []
+                chunks = get_chunks_for_file(conn, file.name, st.session_state.username)
+                for idx, (chunk, size) in enumerate(chunks, 1):
+                    chunks_data.append({
+                        "Chunk #": idx,
+                        "Size (bytes)": size,
+                        "Preview": chunk[:100] + "..." if len(chunk) > 100 else chunk
+                    })
+                st.table(chunks_data)
+            
+            return True
+            
+        except Exception as e:
+            st.error(f"Stage upload error for {file.name}: {str(e)}")
+            return False
+            
+    except Exception as e:
+        st.error(f"Error processing {file.name}: {str(e)}")
+        return False
+    finally:
+        if cursor:
+            cursor.close()
+        try:
+            if local_file_path and os.path.exists(local_file_path):
+                os.remove(local_file_path)
+        except Exception:
+            passimport streamlit as st
 import snowflake.connector
 from snowflake.connector.errors import ProgrammingError
 import os
@@ -300,17 +404,26 @@ def main():
             if query:
                 with st.spinner("Searching..."):
                     results = search_documents(conn, query)
+                    # Display search results
                     if results:
                         for i, result in enumerate(results, 1):
-                            with st.expander(f"Result {i} from {result['file']}", expanded=True):
-                                st.markdown("### Question:")
-                                st.write(query)
-                                st.markdown("### Answer:")
-                                st.write(result['answer'])
-                                st.markdown("### Source Chunks:")
-                                for j, chunk in enumerate(result['chunks'], 1):
-                                    with st.expander(f"Chunk {j} (Size: {chunk['size']} bytes)"):
-                                        st.code(chunk['content'])
+                            st.markdown(f"### Result {i} from {result['file']}")
+                            st.markdown("**Question:**")
+                            st.write(query)
+                            st.markdown("**Answer:**")
+                            st.write(result['answer'])
+                            
+                            # Display chunks in a table
+                            st.markdown("**Source Chunks:**")
+                            chunks_data = []
+                            for j, chunk in enumerate(result['chunks'], 1):
+                                chunks_data.append({
+                                    "Chunk #": j,
+                                    "Size (bytes)": chunk['size'],
+                                    "Content": chunk['content'][:200] + "..." if len(chunk['content']) > 200 else chunk['content']
+                                })
+                            st.table(chunks_data)
+                            st.markdown("---")
                     else:
                         st.info("No relevant answers found")
             else:
