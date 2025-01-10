@@ -8,6 +8,7 @@ from pypdf import PdfReader
 import io
 import ftfy
 import nltk
+import time
 
 from snowflake.core import Root
 
@@ -299,6 +300,19 @@ def check_file_exists(conn, filename, username, session_id):
 def search_documents(conn, query):
     """Search documents using Snowflake Cortex Search Service"""
     try:
+        # First, ensure the service is ready
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT SYSTEM$GET_SERVICE_STATUS(
+            'SAMPLEDATA.PUBLIC.docs_search_svc'
+        );
+        """)
+        status = cursor.fetchone()[0]
+        
+        if 'READY' not in status.upper():
+            st.warning("Search service is still indexing. Please wait a moment and try again.")
+            return []
+        
         # Get Snowpark session and root
         session = st.session_state.snowflake_connection
         root = Root(session)
@@ -314,32 +328,57 @@ def search_documents(conn, query):
             ]
         }
         
-        # Execute search
-        response = svc.search(
-            query=query,
-            columns=["chunk", "relative_path", "size"],
-            filter=filter_obj,
-            limit=3
-        )
-        
-        # Convert response to list of tuples for compatibility
-        results = []
-        if response and hasattr(response, 'to_json'):
-            response_data = response.to_json()
-            if isinstance(response_data, dict) and 'hits' in response_data:
-                for hit in response_data['hits']:
-                    if isinstance(hit, dict):
-                        results.append((
-                            hit.get('chunk', ''),
-                            hit.get('relative_path', ''),
-                            hit.get('size', 0),
-                            hit.get('_score', 1.0)
-                        ))
+        # Execute search with retry
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = svc.search(
+                    query=query,
+                    columns=["chunk", "relative_path", "size"],
+                    filter=filter_obj,
+                    limit=3
+                )
+                
+                # Convert response to list of tuples for compatibility
+                results = []
+                if isinstance(response, dict):
+                    response_data = response  # Response is already a dict
+                elif hasattr(response, 'to_json'):
+                    response_data = response.to_json()
+                else:
+                    response_data = {'hits': []}
+                
+                if isinstance(response_data, dict) and 'hits' in response_data:
+                    for hit in response_data['hits']:
+                        if isinstance(hit, dict):
+                            results.append((
+                                hit.get('chunk', ''),
+                                hit.get('relative_path', ''),
+                                hit.get('size', 0),
+                                hit.get('_score', 1.0)
+                            ))
+                
+                if results:  # If we got results, break the retry loop
+                    break
+                elif attempt < max_retries - 1:  # If no results and not last attempt
+                    st.warning(f"Retrying search... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(2)  # Wait before retrying
+            
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    st.warning(f"Search attempt {attempt + 1} failed, retrying...")
+                    time.sleep(2)
+                else:
+                    raise e
         
         return results
+    
     except Exception as e:
         st.error(f"Search error: {str(e)}")
         return []
+    finally:
+        if cursor:
+            cursor.close()
 
 def generate_response(conn, query, context_chunks):
     """Generate response using basic text concatenation"""
@@ -352,6 +391,24 @@ def generate_response(conn, query, context_chunks):
     except Exception as e:
         st.error(f"Error generating response: {str(e)}")
         return "Sorry, I couldn't generate a response."
+
+def check_search_service_status(conn):
+    """Check if the Cortex Search Service is ready"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT SYSTEM$GET_SERVICE_STATUS(
+            'SAMPLEDATA.PUBLIC.docs_search_svc'
+        );
+        """)
+        status = cursor.fetchone()[0]
+        return status
+    except Exception as e:
+        st.error(f"Error checking service status: {str(e)}")
+        return None
+    finally:
+        if cursor:
+            cursor.close()
 
 def main():
     st.set_page_config(page_title="Document Search & QA System", layout="wide")
@@ -419,6 +476,12 @@ def main():
         
         # Search and QA section
         st.header("🔍 Search & Ask Questions")
+        
+        # Check service status
+        service_status = check_search_service_status(conn)
+        if service_status:
+            st.sidebar.info(f"Search Service Status: {service_status}")
+        
         query = st.text_area("Enter your question:")
         
         if st.button("Ask"):
@@ -427,6 +490,7 @@ def main():
                     # Retrieve relevant chunks
                     relevant_chunks = search_documents(conn, query)
                     
+                    st.write(relevant_chunks)
                     if relevant_chunks:
                         # Generate response using context
                         response = generate_response(conn, query, relevant_chunks)
