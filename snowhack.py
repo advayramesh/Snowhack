@@ -262,47 +262,33 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Search documents using Snowflake Vector Search"""
+    """Search documents using text search"""
     try:
         cursor = conn.cursor()
         
-        # Create UDF for text embedding
+        # Execute text search
         cursor.execute("""
-        CREATE OR REPLACE FUNCTION EMBED_TEXT(input STRING)
-        RETURNS ARRAY
-        RUNTIME_VERSION = '3.8'
-        PACKAGES = ('sentence_transformers')
-        HANDLER = 'embed'
-        AS $$
-def embed(input_text):
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    embedding = model.encode(input_text)
-    return embedding.tolist()
-$$;
-        """)
-        
-        # Execute the vector search
-        cursor.execute("""
-        WITH vector_search AS (
+        WITH ranked_results AS (
             SELECT 
                 chunk,
                 relative_path,
                 size,
                 username,
                 session_id,
-                COSINE_SIMILARITY(
-                    EMBED_TEXT(:query),
-                    EMBED_TEXT(chunk)
-                ) as similarity_score
+                CONTAINS(LOWER(chunk), LOWER(:query)) as exact_match,
+                LENGTH(chunk) as relevance_score
             FROM docs_chunks_table
             WHERE username = :username 
             AND session_id = :session_id
-            QUALIFY ROW_NUMBER() OVER (ORDER BY similarity_score DESC) <= 3
+            AND (
+                CONTAINS(LOWER(chunk), LOWER(:query))
+                OR CONTAINS(LOWER(chunk), ANY(SPLIT(LOWER(:query))))
+            )
+            QUALIFY ROW_NUMBER() OVER (ORDER BY exact_match DESC, relevance_score) <= 3
         )
         SELECT *
-        FROM vector_search
-        ORDER BY similarity_score DESC
+        FROM ranked_results
+        ORDER BY exact_match DESC, relevance_score
         """, {
             'query': query,
             'username': st.session_state.username,
@@ -319,7 +305,7 @@ $$;
         current_file = None
         current_chunks = []
         
-        for chunk, file_name, size, username, session_id, score in results:
+        for chunk, file_name, size, username, session_id, exact_match, score in results:
             if current_file != file_name:
                 if current_file:
                     formatted_results.append({
@@ -332,7 +318,7 @@ $$;
             current_chunks.append({
                 'content': chunk,
                 'size': size,
-                'relevance': float(score)
+                'relevance': 1.0 if exact_match else 0.5
             })
         
         # Add the last file's results
