@@ -101,7 +101,8 @@ def clean_text(text):
     text = ftfy.fix_text(text)
     
     # Additional cleaning steps
-    text = re.sub(r'\s+', ' ', text)  # normalize whitespace
+    text = re.sub(r'\s+', ' ', text)  # normalize whitespace to single spaces
+    text = text.replace(' .', '.').replace(' ,', ',')  # fix common spacing issues
     text = text.strip()
     
     return text
@@ -159,12 +160,14 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
                 file.name
             ))
             
-            # Process text content into chunks
+            # Process text content into chunks with proper spacing
             try:
                 sentences = nltk.sent_tokenize(text_content)
+                # Add space after each sentence
+                sentences = [s.strip() + ' ' for s in sentences]
             except LookupError:
                 # Fall back to simple sentence splitting if NLTK fails
-                sentences = [s.strip() for s in re.split(r'[.!?]+', text_content) if s.strip()]
+                sentences = [s.strip() + ' ' for s in re.split(r'[.!?]+', text_content) if s.strip()]
                 st.warning("Using basic sentence splitting due to NLTK resource unavailability")
             
             # Combine sentences into chunks
@@ -182,6 +185,9 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
                     chunk_text = ' '.join(current_chunk)
                     chunk_text = clean_text(chunk_text)
                     if chunk_text.strip():
+                        # Ensure proper spacing between sentences
+                        chunk_text = chunk_text.replace('.', '. ').replace('!', '! ').replace('?', '? ')
+                        chunk_text = re.sub(r'\s+', ' ', chunk_text).strip()
                         chunks.append(chunk_text)
                     current_chunk = []
                     current_size = 0
@@ -194,6 +200,9 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
                 chunk_text = ' '.join(current_chunk)
                 chunk_text = clean_text(chunk_text)
                 if chunk_text.strip():
+                    # Ensure proper spacing between sentences
+                    chunk_text = chunk_text.replace('.', '. ').replace('!', '! ').replace('?', '? ')
+                    chunk_text = re.sub(r'\s+', ' ', chunk_text).strip()
                     chunks.append(chunk_text)
             
             chunks_created = 0
