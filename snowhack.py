@@ -132,7 +132,7 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
                         file.name,
                         len(chunk),
                         f"@{stage_name}/{safe_filename}",
-                        chunk,  # Store plain text instead of hex
+                        chunk,
                         st.session_state.username,
                         st.session_state.session_id
                     ))
@@ -205,59 +205,63 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Search documents using Cortex with layout mode and session-based filtering"""
+    """Search documents using Cortex Search Service to find relevant chunks"""
     try:
         cursor = conn.cursor()
         
-        # Get documents only from current session
+        # Search for relevant chunks using the search service
+        # Filter by current session and username
         cursor.execute("""
-        SELECT DISTINCT FILE_NAME 
-        FROM UPLOADED_FILES_METADATA
-        WHERE USERNAME = %s
-        AND SESSION_ID = %s
-        """, (st.session_state.username, st.session_state.session_id))
+        SELECT 
+            chunk,
+            relative_path,
+            size,
+            SNOWFLAKE.CORTEX.SEARCH_RELEVANCE(chunk) as relevance
+        FROM SNOWFLAKE.CORTEX.SEARCH(
+            'SAMPLEDATA.PUBLIC.docs_search_svc',
+            %s,
+            {
+                'limit': 3,
+                'filters': {
+                    'username': %s,
+                    'session_id': %s
+                }
+            }
+        )
+        ORDER BY relevance DESC
+        """, (query, st.session_state.username, st.session_state.session_id))
         
-        files = cursor.fetchall()
-        results = []
+        results = cursor.fetchall()
         
-        for file in files:
-            filename = file[0]
+        if not results:
+            return []
             
-            # Get document content using layout mode
-            cursor.execute("""
-            SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
-                '@DOCS',
-                %s,
-                {'mode': 'LAYOUT'}
-            )
-            """, (filename,))
-            
-            doc_content = cursor.fetchone()
-            if doc_content and doc_content[0]:
-                # Get answer
-                cursor.execute("""
-                SELECT SNOWFLAKE.CORTEX.EXTRACT_ANSWER(
-                    %s,
-                    %s
-                )
-                """, (doc_content[0], query))
-                
-                answer = cursor.fetchone()
-                if answer and answer[0]:
-                    # Get associated chunks from current session
-                    chunks = get_chunks_for_file(
-                        conn, 
-                        filename, 
-                        st.session_state.username,
-                        st.session_state.session_id
-                    )
-                    results.append({
-                        'file': filename,
-                        'answer': answer[0],
-                        'chunks': chunks
+        # Format results
+        formatted_results = []
+        current_file = None
+        current_chunks = []
+        
+        for chunk, file_name, size, relevance in results:
+            if current_file != file_name:
+                if current_file:
+                    formatted_results.append({
+                        'file': current_file,
+                        'chunks': current_chunks
                     })
+                current_file = file_name
+                current_chunks = []
+            
+            current_chunks.append((chunk, size))
         
-        return results
+        # Add the last file's results
+        if current_file:
+            formatted_results.append({
+                'file': current_file,
+                'chunks': current_chunks
+            })
+        
+        return formatted_results
+        
     except Exception as e:
         st.error(f"Search error: {str(e)}")
         return []
@@ -339,26 +343,22 @@ def main():
                     results = search_documents(conn, query)
                     # Display search results
                     if results:
+                        st.markdown("### Most Relevant Chunks")
                         for i, result in enumerate(results, 1):
-                            st.markdown(f"### Result {i} from {result['file']}")
-                            st.markdown("**Question:**")
-                            st.write(query)
-                            st.markdown("**Answer:**")
-                            st.write(result['answer'])
+                            st.markdown(f"**Document: {result['file']}**")
                             
                             # Display chunks in a table
-                            st.markdown("**Source Chunks:**")
                             chunks_data = []
                             for j, (chunk_content, size) in enumerate(result['chunks'], 1):
                                 chunks_data.append({
                                     "Chunk #": j,
                                     "Size (bytes)": size,
-                                    "Content": chunk_content[:200] + "..." if len(chunk_content) > 200 else chunk_content
+                                    "Content": chunk_content
                                 })
                             st.table(chunks_data)
                             st.markdown("---")
                     else:
-                        st.info("No relevant answers found")
+                        st.info("No relevant chunks found")
             else:
                 st.warning("Please enter a question")
         
