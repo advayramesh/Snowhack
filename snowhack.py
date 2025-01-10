@@ -8,8 +8,15 @@ from pypdf import PdfReader
 import io
 import ftfy
 import nltk
+from snowflake.snowpark.session import Session
+from snowflake.snowpark.context import get_active_session
+from snowflake.snowpark.functions import col
+from snowflake.core import Root
 
-
+# Add these constants at the top of the file
+CORTEX_SEARCH_DATABASE = "SAMPLEDATA"
+CORTEX_SEARCH_SCHEMA = "PUBLIC"
+CORTEX_SEARCH_SERVICE = "docs_search_svc"
 
 def init_snowflake_connection():
     """Initialize Snowflake connection"""
@@ -138,9 +145,7 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
                 file.name
             ))
             
-            # Process text content into chunks with overlap
-            # Use NLTK for better sentence splitting
-            import nltk
+            
             try:
                 nltk.data.find('tokenizers/punkt')
             except LookupError:
@@ -262,33 +267,47 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Search documents using text matching"""
+    """Search documents using Snowflake Cortex Search Service"""
     try:
-        cursor = conn.cursor()
+        # Get Snowpark session and root
+        session = get_active_session()
+        root = Root(session)
         
-        # Execute basic text search
-        cursor.execute("""
-        WITH ranked_results AS (
-            SELECT 
-                chunk,
-                relative_path as file_name,
-                size,
-                CONTAINS(LOWER(chunk), LOWER(%s)) as exact_match
-            FROM SAMPLEDATA.PUBLIC.DOCS_CHUNKS_TABLE
-            WHERE username = %s 
-            AND session_id = %s
-            AND CONTAINS(LOWER(chunk), LOWER(%s))
-            QUALIFY ROW_NUMBER() OVER (ORDER BY exact_match DESC, size DESC) <= 3
+        # Get the search service
+        svc = root.databases[CORTEX_SEARCH_DATABASE].schemas[CORTEX_SEARCH_SCHEMA].cortex_search_services[CORTEX_SEARCH_SERVICE]
+        
+        # Create filter for current user and session
+        filter_obj = {
+            "@eq": {
+                "username": st.session_state.username,
+                "session_id": st.session_state.session_id
+            }
+        }
+        
+        # Execute search
+        response = svc.search(
+            query=query,
+            columns=["chunk", "relative_path", "size"],
+            filter=filter_obj,
+            limit=3
         )
-        SELECT *
-        FROM ranked_results
-        ORDER BY exact_match DESC, size DESC
-        """, (query, st.session_state.username, st.session_state.session_id, query))
         
-        return cursor.fetchall()
-    finally:
-        if cursor:
-            cursor.close()
+        # Convert response to list of tuples for compatibility
+        results = []
+        response_json = response.to_json()
+        
+        for hit in response_json.get('hits', []):
+            results.append((
+                hit['chunk'],
+                hit['relative_path'],
+                hit['size'],
+                hit.get('_score', 1.0)  # Relevance score
+            ))
+        
+        return results
+    except Exception as e:
+        st.error(f"Search error: {str(e)}")
+        return []
 
 def generate_response(conn, query, context_chunks):
     """Generate response using basic text concatenation"""
