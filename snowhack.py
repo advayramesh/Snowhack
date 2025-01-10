@@ -262,78 +262,62 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Search documents using Snowflake Cortex Search"""
+    """Retrieve relevant documents using Snowflake Cortex Search"""
     try:
         cursor = conn.cursor()
-        
-        # Execute search using Cortex Search Service
         cursor.execute("""
         SELECT 
             chunk,
             relative_path as file_name,
             size,
-            username,
-            session_id,
-            SEARCH_SCORE() as relevance_score
+            snowflake.cortex.complete(
+                'mistral-large-latest',
+                'Rate the semantic similarity between 0 and 1 for this query: ' || %s || ' and this text: ' || chunk || '. Return only the number.'
+            ) as similarity_score
         FROM SAMPLEDATA.PUBLIC.DOCS_CHUNKS_TABLE
         WHERE username = %s 
         AND session_id = %s
-        AND SEARCH_CORTEX(
-            'SAMPLEDATA.PUBLIC.docs_search_svc',
-            %s
-        )
-        ORDER BY relevance_score DESC
-        LIMIT 3
-        """, (
-            st.session_state.username,
-            st.session_state.session_id,
-            query
-        ))
+        QUALIFY ROW_NUMBER() OVER (ORDER BY CAST(REGEXP_SUBSTR(similarity_score, '[0-9]*\.?[0-9]+') AS FLOAT) DESC) <= 3
+        ORDER BY CAST(REGEXP_SUBSTR(similarity_score, '[0-9]*\.?[0-9]+') AS FLOAT) DESC
+        """, (query, st.session_state.username, st.session_state.session_id))
         
-        results = cursor.fetchall()
+        return cursor.fetchall()
+    finally:
+        if cursor:
+            cursor.close()
+
+def generate_response(conn, query, context_chunks):
+    """Generate response using Mistral LLM with retrieved context"""
+    try:
+        cursor = conn.cursor()
         
-        if not results:
-            return []
+        # Combine context chunks
+        context = "\n\n".join([chunk[0] for chunk in context_chunks])
+        
+        # Generate response using Mistral
+        cursor.execute("""
+        SELECT snowflake.cortex.complete(
+            'mistral-large-latest',
+            'You are a helpful assistant. Use the following context to answer the question. 
+            If you cannot answer based on the context, say so.
             
-        # Format results
-        formatted_results = []
-        current_file = None
-        current_chunks = []
-        
-        for chunk, file_name, size, username, session_id, score in results:
-            if current_file != file_name:
-                if current_file:
-                    formatted_results.append({
-                        'file': current_file,
-                        'chunks': current_chunks
-                    })
-                current_file = file_name
-                current_chunks = []
+            Context:
+            ' || %s || '
             
-            current_chunks.append({
-                'content': chunk,
-                'size': size,
-                'relevance': float(score)
-            })
+            Question: ' || %s || '
+            
+            Answer: '
+        ) as response
+        """, (context, query))
         
-        # Add the last file's results
-        if current_file:
-            formatted_results.append({
-                'file': current_file,
-                'chunks': current_chunks
-            })
-        
-        return formatted_results
-        
-    except Exception as e:
-        st.error(f"Search error: {str(e)}")
-        return []
+        result = cursor.fetchone()
+        return result[0] if result else "Sorry, I couldn't generate a response."
     finally:
         if cursor:
             cursor.close()
 
 def main():
-    st.set_page_config(page_title="Document Search System", layout="wide")
+    st.set_page_config(page_title="Document Search & QA System", layout="wide")
     
     # Initialize session state
     if 'authenticated' not in st.session_state:
@@ -381,7 +365,7 @@ def main():
     
     else:
         # Main application UI
-        st.title("Document Search System")
+        st.title("Document Search & QA System")
         
         # File upload section
         st.header("📤 Upload Documents")
@@ -396,35 +380,35 @@ def main():
                 for file in uploaded_files:
                     process_and_upload_file(conn, file)
         
-        # Search section
-        st.header("🔍 Search Documents")
-        query = st.text_area("Enter your search query:")
+        # Search and QA section
+        st.header("🔍 Search & Ask Questions")
+        query = st.text_area("Enter your question:")
         
-        if st.button("Search"):
+        if st.button("Ask"):
             if query:
-                with st.spinner("Searching..."):
-                    results = search_documents(conn, query)
-                    # Display search results
-                    if results:
-                        st.markdown("### Most Relevant Chunks")
-                        for i, result in enumerate(results, 1):
-                            st.markdown(f"**Document: {result['file']}**")
-                            
-                            # Display chunks in a table
-                            chunks_data = []
-                            for j, chunk_info in enumerate(result['chunks'], 1):
-                                chunks_data.append({
-                                    "Chunk #": j,
-                                    "Size (bytes)": chunk_info['size'],
-                                    "Relevance Score": f"{chunk_info['relevance']:.3f}",
-                                    "Content": chunk_info['content']
-                                })
-                            st.table(chunks_data)
-                            st.markdown("---")
+                with st.spinner("Thinking..."):
+                    # Retrieve relevant chunks
+                    relevant_chunks = search_documents(conn, query)
+                    
+                    if relevant_chunks:
+                        # Generate response using context
+                        response = generate_response(conn, query, relevant_chunks)
+                        
+                        # Display response
+                        st.markdown("### Answer")
+                        st.write(response)
+                        
+                        # Display source documents
+                        with st.expander("View Source Documents"):
+                            for i, (chunk, file_name, size, score) in enumerate(relevant_chunks, 1):
+                                st.markdown(f"**Source {i}: {file_name}**")
+                                st.markdown(f"Relevance Score: {float(score):.3f}")
+                                st.markdown(chunk)
+                                st.markdown("---")
                     else:
-                        st.info("No relevant chunks found")
+                        st.info("No relevant information found in the documents.")
             else:
-                st.warning("Please enter a search query")
+                st.warning("Please enter a question")
         
         # Logout button
         if st.sidebar.button("Logout"):
