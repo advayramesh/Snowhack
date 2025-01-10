@@ -69,12 +69,17 @@ def extract_text_from_pdf(file_content):
 def process_and_upload_file(conn, file, stage_name="DOCS"):
     """Process a file, upload to stage, and store chunks"""
     cursor = None
-    temp_dir = "temp_uploads"
+    temp_dir = "/tmp/uploads"  # Use absolute path in /tmp
     local_file_path = None
     
     try:
-        # Create temp directory if it doesn't exist
-        os.makedirs(temp_dir, exist_ok=True)
+        # Check if file already exists in session
+        if check_file_exists(conn, file.name, st.session_state.username, st.session_state.session_id):
+            st.warning(f"File {file.name} already processed in this session. Skipping...")
+            return True
+
+        # Create temp directory with proper permissions
+        os.makedirs(temp_dir, mode=0o777, exist_ok=True)
         
         cursor = conn.cursor()
         file_content = file.getvalue()
@@ -177,6 +182,25 @@ def get_chunks_for_file(conn, filename, username, session_id):
     except Exception as e:
         st.error(f"Error fetching chunks: {str(e)}")
         return []
+    finally:
+        cursor.close()
+
+def check_file_exists(conn, filename, username, session_id):
+    """Check if file already exists in the current session"""
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT COUNT(*) 
+        FROM UPLOADED_FILES_METADATA 
+        WHERE USERNAME = %s 
+        AND SESSION_ID = %s 
+        AND FILE_NAME = %s
+        """, (username, session_id, filename))
+        count = cursor.fetchone()[0]
+        return count > 0
+    except Exception as e:
+        st.error(f"Error checking file existence: {str(e)}")
+        return False
     finally:
         cursor.close()
 
