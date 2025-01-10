@@ -100,9 +100,16 @@ def clean_text(text):
     # Fix text encoding issues
     text = ftfy.fix_text(text)
     
+    # Fix common OCR issues with word spacing
+    text = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', text)  # Add space between camelCase
+    text = re.sub(r'(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])', ' ', text)  # Add space between letters and numbers
+    
     # Additional cleaning steps
     text = re.sub(r'\s+', ' ', text)  # normalize whitespace to single spaces
     text = text.replace(' .', '.').replace(' ,', ',')  # fix common spacing issues
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)  # Add space between words
+    text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)  # Add space between letters and numbers
+    text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)  # Add space between numbers and letters
     text = text.strip()
     
     return text
@@ -317,15 +324,17 @@ def search_documents(conn, query):
         
         # Convert response to list of tuples for compatibility
         results = []
-        response_json = response.to_json()
-        
-        for hit in response_json.get('hits', []):
-            results.append((
-                hit['chunk'],
-                hit['relative_path'],
-                hit['size'],
-                hit.get('_score', 1.0)  # Relevance score
-            ))
+        if response and hasattr(response, 'to_json'):
+            response_data = response.to_json()
+            if isinstance(response_data, dict) and 'hits' in response_data:
+                for hit in response_data['hits']:
+                    if isinstance(hit, dict):
+                        results.append((
+                            hit.get('chunk', ''),
+                            hit.get('relative_path', ''),
+                            hit.get('size', 0),
+                            hit.get('_score', 1.0)
+                        ))
         
         return results
     except Exception as e:
