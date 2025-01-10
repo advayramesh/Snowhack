@@ -262,33 +262,28 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Search documents using text search"""
+    """Search documents using Snowflake Cortex Search"""
     try:
         cursor = conn.cursor()
         
-        # Execute text search
+        # Execute search using Cortex Search Service
         cursor.execute("""
-        WITH ranked_results AS (
-            SELECT 
-                chunk,
-                relative_path,
-                size,
-                username,
-                session_id,
-                CONTAINS(LOWER(chunk), LOWER(:query)) as exact_match,
-                LENGTH(chunk) as relevance_score
-            FROM docs_chunks_table
-            WHERE username = :username 
-            AND session_id = :session_id
-            AND (
-                CONTAINS(LOWER(chunk), LOWER(:query))
-                OR CONTAINS(LOWER(chunk), ANY(SPLIT(LOWER(:query))))
-            )
-            QUALIFY ROW_NUMBER() OVER (ORDER BY exact_match DESC, relevance_score) <= 3
+        SELECT 
+            chunk,
+            relative_path as file_name,
+            size,
+            username,
+            session_id,
+            SEARCH_SCORE() as relevance_score
+        FROM SAMPLEDATA.PUBLIC.DOCS_CHUNKS_TABLE
+        WHERE username = :username 
+        AND session_id = :session_id
+        AND SEARCH_CORTEX(
+            'SAMPLEDATA.PUBLIC.docs_search_svc',
+            :query
         )
-        SELECT *
-        FROM ranked_results
-        ORDER BY exact_match DESC, relevance_score
+        ORDER BY relevance_score DESC
+        LIMIT 3
         """, {
             'query': query,
             'username': st.session_state.username,
@@ -305,7 +300,7 @@ def search_documents(conn, query):
         current_file = None
         current_chunks = []
         
-        for chunk, file_name, size, username, session_id, exact_match, score in results:
+        for chunk, file_name, size, username, session_id, score in results:
             if current_file != file_name:
                 if current_file:
                     formatted_results.append({
@@ -318,7 +313,7 @@ def search_documents(conn, query):
             current_chunks.append({
                 'content': chunk,
                 'size': size,
-                'relevance': 1.0 if exact_match else 0.5
+                'relevance': float(score)
             })
         
         # Add the last file's results
