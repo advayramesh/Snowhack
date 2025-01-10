@@ -266,20 +266,20 @@ def search_documents(conn, query):
     try:
         cursor = conn.cursor()
         
-        # Execute vector search using Cortex
+        # Create UDF for text embedding
         cursor.execute("""
-        CREATE FUNCTION IF NOT EXISTS EMBED_TEXT(input TEXT)
-        RETURNS VECTOR
-        LANGUAGE PYTHON
+        CREATE OR REPLACE FUNCTION EMBED_TEXT(input STRING)
+        RETURNS ARRAY
         RUNTIME_VERSION = '3.8'
-        PACKAGES = ('sentence_transformers',)
+        PACKAGES = ('sentence_transformers')
         HANDLER = 'embed'
         AS $$
-        from sentence_transformers import SentenceTransformer
-        def embed(input_text):
-            model = SentenceTransformer('all-MiniLM-L6-v2')
-            return model.encode(input_text)
-        $$;
+def embed(input_text):
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    embedding = model.encode(input_text)
+    return embedding.tolist()
+$$;
         """)
         
         # Execute the vector search
@@ -291,7 +291,7 @@ def search_documents(conn, query):
                 size,
                 username,
                 session_id,
-                VECTOR_COSINE_SIMILARITY(
+                COSINE_SIMILARITY(
                     EMBED_TEXT(:query),
                     EMBED_TEXT(chunk)
                 ) as similarity_score
