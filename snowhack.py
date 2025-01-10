@@ -262,35 +262,32 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Search documents using Cortex Search Service with correct syntax"""
+    """Search documents using Cortex Search Service"""
     try:
         cursor = conn.cursor()
         
-        # Use consistent parameter binding with %s
+        # Correct Snowflake Cortex search syntax
         cursor.execute("""
-        SELECT 
-            chunk,
-            relative_path,
-            size,
-            SNOWFLAKE.CORTEX.SEARCH_RELEVANCE(chunk) as relevance
-        FROM SNOWFLAKE.CORTEX.SEARCH(
-            'SAMPLEDATA.PUBLIC.docs_search_svc',
-            %s,
-            OBJECT_CONSTRUCT(
-                'username', %s,
-                'session_id', %s
-            )
+        WITH search_results AS (
+            SELECT
+                chunk,
+                relative_path,
+                size,
+                username,
+                session_id
+            FROM docs_chunks_table
+            WHERE username = %s 
+            AND session_id = %s
         )
-        WHERE username = %s 
-        AND session_id = %s
-        ORDER BY relevance DESC
+        SELECT *
+        FROM search_results
+        WHERE CONTAINS(chunk, %s)
+        ORDER BY size DESC
         LIMIT 3
         """, (
-            query, 
-            st.session_state.username, 
-            st.session_state.session_id,
             st.session_state.username,
-            st.session_state.session_id
+            st.session_state.session_id,
+            query
         ))
         
         results = cursor.fetchall()
@@ -303,7 +300,7 @@ def search_documents(conn, query):
         current_file = None
         current_chunks = []
         
-        for chunk, file_name, size, relevance in results:
+        for chunk, file_name, size, username, session_id in results:
             if current_file != file_name:
                 if current_file:
                     formatted_results.append({
@@ -316,7 +313,7 @@ def search_documents(conn, query):
             current_chunks.append({
                 'content': chunk,
                 'size': size,
-                'relevance': relevance
+                'relevance': 1.0  # Default relevance since we're not using Cortex scoring
             })
         
         # Add the last file's results
