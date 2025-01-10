@@ -262,44 +262,52 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Search documents with flexible text matching"""
+    """Search documents using Snowflake Vector Search"""
     try:
         cursor = conn.cursor()
         
-        # Prepare search terms by splitting query into words
-        search_terms = query.strip().split()
-        if not search_terms:
-            return []
-            
-        # Create a LIKE condition for each term
-        conditions = []
-        params = [st.session_state.username, st.session_state.session_id]
+        # Execute vector search using Cortex
+        cursor.execute("""
+        CREATE FUNCTION IF NOT EXISTS EMBED_TEXT(input TEXT)
+        RETURNS VECTOR
+        LANGUAGE PYTHON
+        RUNTIME_VERSION = '3.8'
+        PACKAGES = ('sentence_transformers',)
+        HANDLER = 'embed'
+        AS $$
+        from sentence_transformers import SentenceTransformer
+        def embed(input_text):
+            model = SentenceTransformer('all-MiniLM-L6-v2')
+            return model.encode(input_text)
+        $$;
+        """)
         
-        for term in search_terms:
-            conditions.append("LOWER(chunk) LIKE LOWER(%s)")
-            params.append(f"%{term}%")
-            
-        where_clause = " OR ".join(conditions)
-        
-        # Execute search with flexible matching
-        cursor.execute(f"""
-        WITH search_results AS (
-            SELECT
+        # Execute the vector search
+        cursor.execute("""
+        WITH vector_search AS (
+            SELECT 
                 chunk,
                 relative_path,
                 size,
                 username,
-                session_id
+                session_id,
+                VECTOR_COSINE_SIMILARITY(
+                    EMBED_TEXT(:query),
+                    EMBED_TEXT(chunk)
+                ) as similarity_score
             FROM docs_chunks_table
-            WHERE username = %s 
-            AND session_id = %s
-            AND ({where_clause})
+            WHERE username = :username 
+            AND session_id = :session_id
+            QUALIFY ROW_NUMBER() OVER (ORDER BY similarity_score DESC) <= 3
         )
         SELECT *
-        FROM search_results
-        ORDER BY size DESC
-        LIMIT 3
-        """, params)
+        FROM vector_search
+        ORDER BY similarity_score DESC
+        """, {
+            'query': query,
+            'username': st.session_state.username,
+            'session_id': st.session_state.session_id
+        })
         
         results = cursor.fetchall()
         
@@ -311,7 +319,7 @@ def search_documents(conn, query):
         current_file = None
         current_chunks = []
         
-        for chunk, file_name, size, username, session_id in results:
+        for chunk, file_name, size, username, session_id, score in results:
             if current_file != file_name:
                 if current_file:
                     formatted_results.append({
@@ -321,15 +329,10 @@ def search_documents(conn, query):
                 current_file = file_name
                 current_chunks = []
             
-            # Calculate a simple relevance score based on how many terms match
-            matched_terms = sum(1 for term in search_terms 
-                              if term.lower() in chunk.lower())
-            relevance = matched_terms / len(search_terms)
-            
             current_chunks.append({
                 'content': chunk,
                 'size': size,
-                'relevance': relevance
+                'relevance': float(score)
             })
         
         # Add the last file's results
