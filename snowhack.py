@@ -16,6 +16,16 @@ CORTEX_SEARCH_DATABASE = "SAMPLEDATA"
 CORTEX_SEARCH_SCHEMA = "PUBLIC"
 CORTEX_SEARCH_SERVICE = "docs_search_svc"
 
+# Create NLTK data directory if it doesn't exist
+nltk_data_dir = os.path.expanduser('~/nltk_data')
+os.makedirs(nltk_data_dir, exist_ok=True)
+
+# Download required NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt', download_dir=nltk_data_dir)
+
 def init_snowflake_connection():
     """Initialize Snowflake connection"""
     return snowflake.connector.connect(
@@ -142,12 +152,6 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
                 stage_name,
                 file.name
             ))
-            
-            
-            try:
-                nltk.data.find('tokenizers/punkt')
-            except LookupError:
-                nltk.download('punkt')
             
             sentences = nltk.sent_tokenize(text_content)
             
