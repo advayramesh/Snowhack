@@ -6,6 +6,8 @@ import re
 from hashlib import sha256
 from pypdf import PdfReader
 import io
+import ftfy
+import nltk
 
 
 
