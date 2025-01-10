@@ -49,8 +49,8 @@ def register_user(conn, username, password):
     finally:
         cursor.close()
 
-def get_chunks_for_file(conn, filename, username):
-    """Retrieve all chunks for a specific file"""
+def get_chunks_for_file(conn, filename, username, session_id):
+    """Retrieve all chunks for a specific file in the current session"""
     try:
         cursor = conn.cursor()
         cursor.execute("""
@@ -58,8 +58,9 @@ def get_chunks_for_file(conn, filename, username):
         FROM DOCS_CHUNKS_TABLE 
         WHERE RELATIVE_PATH = %s 
         AND USERNAME = %s
+        AND SESSION_ID = %s
         ORDER BY SIZE
-        """, (filename, username))
+        """, (filename, username, session_id))
         return cursor.fetchall()
     except Exception as e:
         st.error(f"Error fetching chunks: {str(e)}")
@@ -93,7 +94,7 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
             cursor.execute(put_command)
             st.success(f"✅ {file.name} uploaded to stage")
             
-            # Store metadata
+            # Store metadata with session ID
             cursor.execute("""
             INSERT INTO UPLOADED_FILES_METADATA 
             (USERNAME, SESSION_ID, STAGE_NAME, FILE_NAME)
@@ -128,9 +129,14 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
             
             st.success(f"✅ Created {chunks_created} chunks for {file.name}")
             
-            # Display chunks
+            # Display chunks for current session
             st.write(f"### Chunks for {file.name}:")
-            chunks = get_chunks_for_file(conn, file.name, st.session_state.username)
+            chunks = get_chunks_for_file(
+                conn, 
+                file.name, 
+                st.session_state.username,
+                st.session_state.session_id
+            )
             
             for idx, (chunk, size) in enumerate(chunks, 1):
                 with st.expander(f"Chunk {idx} (Size: {size} bytes)"):
@@ -160,16 +166,17 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
             pass
 
 def search_documents(conn, query):
-    """Search documents using Cortex"""
+    """Search documents using Cortex with layout mode and session-based filtering"""
     try:
         cursor = conn.cursor()
         
-        # Get all documents for the user
+        # Get documents only from current session
         cursor.execute("""
         SELECT DISTINCT FILE_NAME 
         FROM UPLOADED_FILES_METADATA
         WHERE USERNAME = %s
-        """, (st.session_state.username,))
+        AND SESSION_ID = %s
+        """, (st.session_state.username, st.session_state.session_id))
         
         files = cursor.fetchall()
         results = []
@@ -177,11 +184,12 @@ def search_documents(conn, query):
         for file in files:
             filename = file[0]
             
-            # Get document content
+            # Get document content using layout mode
             cursor.execute("""
             SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
                 '@DOCS',
-                %s
+                %s,
+                {'mode': 'LAYOUT'}
             )
             """, (filename,))
             
@@ -197,8 +205,17 @@ def search_documents(conn, query):
                 
                 answer = cursor.fetchone()
                 if answer and answer[0]:
-                    # Get associated chunks
-                    chunks = get_chunks_for_file(conn, filename, st.session_state.username)
+                    # Get associated chunks from current session
+                    cursor.execute("""
+                    SELECT CHUNK, SIZE
+                    FROM DOCS_CHUNKS_TABLE 
+                    WHERE RELATIVE_PATH = %s 
+                    AND USERNAME = %s
+                    AND SESSION_ID = %s
+                    ORDER BY SIZE
+                    """, (filename, st.session_state.username, st.session_state.session_id))
+                    
+                    chunks = cursor.fetchall()
                     decoded_chunks = []
                     
                     for chunk, size in chunks:
