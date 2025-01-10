@@ -26,6 +26,12 @@ try:
 except LookupError:
     nltk.download('punkt', download_dir=nltk_data_dir)
 
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab', download_dir=nltk_data_dir, quiet=True)
+    # If punkt_tab fails, we'll fall back to punkt
+
 def init_snowflake_connection():
     """Initialize Snowflake connection"""
     return snowflake.connector.connect(
@@ -153,7 +159,13 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
                 file.name
             ))
             
-            sentences = nltk.sent_tokenize(text_content)
+            # Process text content into chunks
+            try:
+                sentences = nltk.sent_tokenize(text_content)
+            except LookupError:
+                # Fall back to simple sentence splitting if NLTK fails
+                sentences = [s.strip() for s in re.split(r'[.!?]+', text_content) if s.strip()]
+                st.warning("Using basic sentence splitting due to NLTK resource unavailability")
             
             # Combine sentences into chunks
             chunk_size = 4000
