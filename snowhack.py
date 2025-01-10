@@ -2,9 +2,37 @@ import streamlit as st
 import snowflake.connector
 from snowflake.connector.errors import ProgrammingError
 import os
+import re
 from hashlib import sha256
 from pypdf import PdfReader
 import io
+
+def clean_text(text):
+    """Clean text by removing extra spaces and fixing common encoding issues"""
+    # Remove extra spaces between words
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Fix common spacing issues around punctuation
+    text = re.sub(r'\s*([,.!?:;])\s*', r'\1 ', text)
+    
+    # Remove spaces before apostrophes and fix common contractions
+    text = re.sub(r'\s\'', '\'', text)
+    
+    # Fix spaces around parentheses
+    text = re.sub(r'\s*\(\s*', ' (', text)
+    text = re.sub(r'\s*\)\s*', ') ', text)
+    
+    # Remove any non-breaking spaces or other special whitespace
+    text = re.sub(r'[\xa0\u200b\u2000-\u200f\u2028-\u202f]', ' ', text)
+    
+    # Normalize quotes
+    text = re.sub(r'["""]', '"', text)
+    text = re.sub(r'[''']', "'", text)
+    
+    # Clean up multiple spaces again and trim
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
 
 def init_snowflake_connection():
     """Initialize Snowflake connection"""
@@ -69,7 +97,7 @@ def extract_text_from_pdf(file_content):
 def process_and_upload_file(conn, file, stage_name="DOCS"):
     """Process a file, upload to stage, and store chunks"""
     cursor = None
-    temp_dir = "/tmp/uploads"  # Use absolute path in /tmp
+    temp_dir = "/tmp/uploads"
     local_file_path = None
     
     try:
@@ -78,19 +106,21 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
             st.warning(f"File {file.name} already processed in this session. Skipping...")
             return True
 
-        # Create temp directory with proper permissions
         os.makedirs(temp_dir, mode=0o777, exist_ok=True)
         
         cursor = conn.cursor()
         file_content = file.getvalue()
         
-        # Extract text if PDF, otherwise use raw content
+        # Extract text and clean it
         if file.name.lower().endswith('.pdf'):
             text_content = extract_text_from_pdf(file_content)
             if text_content is None:
                 return False
         else:
             text_content = file_content.decode('utf-8', errors='ignore')
+        
+        # Clean the extracted text
+        text_content = clean_text(text_content)
         
         # Save file locally for stage upload
         safe_filename = file.name.replace(" ", "_")
@@ -117,13 +147,32 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
                 file.name
             ))
             
-            # Process text content into chunks
-            chunk_size = 4000  # Reduced chunk size for better readability
-            chunks = [text_content[i:i + chunk_size] for i in range(0, len(text_content), chunk_size)]
-            chunks_created = 0
+            # Process text content into chunks with overlap
+            chunk_size = 4000
+            overlap = 200  # Add overlap between chunks
             
+            chunks = []
+            start = 0
+            while start < len(text_content):
+                # Get chunk with overlap
+                end = start + chunk_size
+                chunk = text_content[start:end]
+                
+                # If this isn't the first chunk, include some overlap from previous chunk
+                if start > 0:
+                    chunk = text_content[max(0, start - overlap):end]
+                
+                # Clean the chunk
+                chunk = clean_text(chunk)
+                
+                if chunk.strip():
+                    chunks.append(chunk)
+                
+                start += chunk_size - overlap
+            
+            chunks_created = 0
             for chunk in chunks:
-                if chunk.strip():  # Only store non-empty chunks
+                if chunk.strip():
                     cursor.execute("""
                     INSERT INTO DOCS_CHUNKS_TABLE 
                     (RELATIVE_PATH, SIZE, FILE_URL, CHUNK, USERNAME, SESSION_ID)
@@ -146,7 +195,7 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
             
             for idx, (chunk, size) in enumerate(chunks, 1):
                 with st.expander(f"Chunk {idx} (Size: {size} bytes)"):
-                    st.markdown(chunk)  # Display as markdown for better formatting
+                    st.markdown(chunk)
             
             return True
             
@@ -205,12 +254,11 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Search documents using Cortex Search Service to find relevant chunks"""
+    """Search documents using Cortex Search Service with correct syntax"""
     try:
         cursor = conn.cursor()
         
-        # Search for relevant chunks using the search service
-        # Filter by current session and username
+        # Use correct Snowflake syntax for search
         cursor.execute("""
         SELECT 
             chunk,
@@ -219,16 +267,16 @@ def search_documents(conn, query):
             SNOWFLAKE.CORTEX.SEARCH_RELEVANCE(chunk) as relevance
         FROM SNOWFLAKE.CORTEX.SEARCH(
             'SAMPLEDATA.PUBLIC.docs_search_svc',
-            %s,
-            {
-                'limit': 3,
-                'filters': {
-                    'username': %s,
-                    'session_id': %s
-                }
-            }
+            :1,
+            OBJECT_CONSTRUCT(
+                'username', :2,
+                'session_id', :3
+            )
         )
+        WHERE username = :2 
+        AND session_id = :3
         ORDER BY relevance DESC
+        LIMIT 3
         """, (query, st.session_state.username, st.session_state.session_id))
         
         results = cursor.fetchall()
@@ -251,7 +299,11 @@ def search_documents(conn, query):
                 current_file = file_name
                 current_chunks = []
             
-            current_chunks.append((chunk, size))
+            current_chunks.append({
+                'content': chunk,
+                'size': size,
+                'relevance': relevance
+            })
         
         # Add the last file's results
         if current_file:
@@ -270,7 +322,7 @@ def search_documents(conn, query):
             cursor.close()
 
 def main():
-    st.set_page_config(page_title="Document Q&A System", layout="wide")
+    st.set_page_config(page_title="Document Search System", layout="wide")
     
     # Initialize session state
     if 'authenticated' not in st.session_state:
@@ -318,7 +370,7 @@ def main():
     
     else:
         # Main application UI
-        st.title("Document Q&A System")
+        st.title("Document Search System")
         
         # File upload section
         st.header("📤 Upload Documents")
@@ -333,9 +385,9 @@ def main():
                 for file in uploaded_files:
                     process_and_upload_file(conn, file)
         
-        # Q&A section
-        st.header("❓ Ask Questions")
-        query = st.text_area("Enter your question:")
+        # Search section
+        st.header("🔍 Search Documents")
+        query = st.text_area("Enter your search query:")
         
         if st.button("Search"):
             if query:
@@ -349,18 +401,19 @@ def main():
                             
                             # Display chunks in a table
                             chunks_data = []
-                            for j, (chunk_content, size) in enumerate(result['chunks'], 1):
+                            for j, chunk_info in enumerate(result['chunks'], 1):
                                 chunks_data.append({
                                     "Chunk #": j,
-                                    "Size (bytes)": size,
-                                    "Content": chunk_content
+                                    "Size (bytes)": chunk_info['size'],
+                                    "Relevance Score": f"{chunk_info['relevance']:.3f}",
+                                    "Content": chunk_info['content']
                                 })
                             st.table(chunks_data)
                             st.markdown("---")
                     else:
                         st.info("No relevant chunks found")
             else:
-                st.warning("Please enter a question")
+                st.warning("Please enter a search query")
         
         # Logout button
         if st.sidebar.button("Logout"):
