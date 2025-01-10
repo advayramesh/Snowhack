@@ -7,32 +7,7 @@ from hashlib import sha256
 from pypdf import PdfReader
 import io
 
-def clean_text(text):
-    """Clean text by removing extra spaces and fixing common encoding issues"""
-    # Remove extra spaces between words
-    text = re.sub(r'\s+', ' ', text)
-    
-    # Fix common spacing issues around punctuation
-    text = re.sub(r'\s*([,.!?:;])\s*', r'\1 ', text)
-    
-    # Remove spaces before apostrophes and fix common contractions
-    text = re.sub(r'\s\'', '\'', text)
-    
-    # Fix spaces around parentheses
-    text = re.sub(r'\s*\(\s*', ' (', text)
-    text = re.sub(r'\s*\)\s*', ') ', text)
-    
-    # Remove any non-breaking spaces or other special whitespace
-    text = re.sub(r'[\xa0\u200b\u2000-\u200f\u2028-\u202f]', ' ', text)
-    
-    # Normalize quotes
-    text = re.sub(r'["""]', '"', text)
-    text = re.sub(r'[''']', "'", text)
-    
-    # Clean up multiple spaces again and trim
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    return text
+
 
 def init_snowflake_connection():
     """Initialize Snowflake connection"""
@@ -94,6 +69,20 @@ def extract_text_from_pdf(file_content):
         st.error(f"Error extracting PDF content: {str(e)}")
         return None
 
+def clean_text(text):
+    """Clean text using ftfy library and additional cleaning"""
+    import ftfy
+    import re
+    
+    # Fix text encoding issues
+    text = ftfy.fix_text(text)
+    
+    # Additional cleaning steps
+    text = re.sub(r'\s+', ' ', text)  # normalize whitespace
+    text = text.strip()
+    
+    return text
+
 def process_and_upload_file(conn, file, stage_name="DOCS"):
     """Process a file, upload to stage, and store chunks"""
     cursor = None
@@ -148,27 +137,43 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
             ))
             
             # Process text content into chunks with overlap
-            chunk_size = 4000
-            overlap = 200  # Add overlap between chunks
+            # Use NLTK for better sentence splitting
+            import nltk
+            try:
+                nltk.data.find('tokenizers/punkt')
+            except LookupError:
+                nltk.download('punkt')
             
+            sentences = nltk.sent_tokenize(text_content)
+            
+            # Combine sentences into chunks
+            chunk_size = 4000
+            current_chunk = []
+            current_size = 0
             chunks = []
-            start = 0
-            while start < len(text_content):
-                # Get chunk with overlap
-                end = start + chunk_size
-                chunk = text_content[start:end]
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                sentence_size = len(sentence)
                 
-                # If this isn't the first chunk, include some overlap from previous chunk
-                if start > 0:
-                    chunk = text_content[max(0, start - overlap):end]
+                if current_size + sentence_size > chunk_size and current_chunk:
+                    # Join current chunk and add to chunks
+                    chunk_text = ' '.join(current_chunk)
+                    chunk_text = clean_text(chunk_text)
+                    if chunk_text.strip():
+                        chunks.append(chunk_text)
+                    current_chunk = []
+                    current_size = 0
                 
-                # Clean the chunk
-                chunk = clean_text(chunk)
-                
-                if chunk.strip():
-                    chunks.append(chunk)
-                
-                start += chunk_size - overlap
+                current_chunk.append(sentence)
+                current_size += sentence_size
+            
+            # Add the last chunk if it exists
+            if current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                chunk_text = clean_text(chunk_text)
+                if chunk_text.strip():
+                    chunks.append(chunk_text)
             
             chunks_created = 0
             for chunk in chunks:
@@ -214,6 +219,7 @@ def process_and_upload_file(conn, file, stage_name="DOCS"):
                 os.remove(local_file_path)
         except Exception:
             pass
+
 
 def get_chunks_for_file(conn, filename, username, session_id):
     """Retrieve all chunks for a specific file"""
