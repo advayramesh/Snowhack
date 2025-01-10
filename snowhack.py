@@ -290,12 +290,12 @@ def search_documents(conn, query):
         # Get the search service
         svc = root.databases[CORTEX_SEARCH_DATABASE].schemas[CORTEX_SEARCH_SCHEMA].cortex_search_services[CORTEX_SEARCH_SERVICE]
         
-        # Create filter for current user and session
+        # Create filter for current user and session using @and
         filter_obj = {
-            "@eq": {
-                "username": st.session_state.username,
-                "session_id": st.session_state.session_id
-            }
+            "@and": [
+                {"@eq": {"username": st.session_state.username}},
+                {"@eq": {"session_id": st.session_state.session_id}}
+            ]
         }
         
         # Execute search
