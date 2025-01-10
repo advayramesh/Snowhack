@@ -262,12 +262,27 @@ def check_file_exists(conn, filename, username, session_id):
         cursor.close()
 
 def search_documents(conn, query):
-    """Search documents using Cortex Search Service"""
+    """Search documents with flexible text matching"""
     try:
         cursor = conn.cursor()
         
-        # Correct Snowflake Cortex search syntax
-        cursor.execute("""
+        # Prepare search terms by splitting query into words
+        search_terms = query.strip().split()
+        if not search_terms:
+            return []
+            
+        # Create a LIKE condition for each term
+        conditions = []
+        params = [st.session_state.username, st.session_state.session_id]
+        
+        for term in search_terms:
+            conditions.append("LOWER(chunk) LIKE LOWER(%s)")
+            params.append(f"%{term}%")
+            
+        where_clause = " OR ".join(conditions)
+        
+        # Execute search with flexible matching
+        cursor.execute(f"""
         WITH search_results AS (
             SELECT
                 chunk,
@@ -278,17 +293,13 @@ def search_documents(conn, query):
             FROM docs_chunks_table
             WHERE username = %s 
             AND session_id = %s
+            AND ({where_clause})
         )
         SELECT *
         FROM search_results
-        WHERE CONTAINS(chunk, %s)
         ORDER BY size DESC
         LIMIT 3
-        """, (
-            st.session_state.username,
-            st.session_state.session_id,
-            query
-        ))
+        """, params)
         
         results = cursor.fetchall()
         
@@ -310,10 +321,15 @@ def search_documents(conn, query):
                 current_file = file_name
                 current_chunks = []
             
+            # Calculate a simple relevance score based on how many terms match
+            matched_terms = sum(1 for term in search_terms 
+                              if term.lower() in chunk.lower())
+            relevance = matched_terms / len(search_terms)
+            
             current_chunks.append({
                 'content': chunk,
                 'size': size,
-                'relevance': 1.0  # Default relevance since we're not using Cortex scoring
+                'relevance': relevance
             })
         
         # Add the last file's results
