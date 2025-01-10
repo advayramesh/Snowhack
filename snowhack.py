@@ -276,19 +276,19 @@ def search_documents(conn, query):
             session_id,
             SEARCH_SCORE() as relevance_score
         FROM SAMPLEDATA.PUBLIC.DOCS_CHUNKS_TABLE
-        WHERE username = :username 
-        AND session_id = :session_id
+        WHERE username = %s 
+        AND session_id = %s
         AND SEARCH_CORTEX(
             'SAMPLEDATA.PUBLIC.docs_search_svc',
-            :query
+            %s
         )
         ORDER BY relevance_score DESC
         LIMIT 3
-        """, {
-            'query': query,
-            'username': st.session_state.username,
-            'session_id': st.session_state.session_id
-        })
+        """, (
+            st.session_state.username,
+            st.session_state.session_id,
+            query
+        ))
         
         results = cursor.fetchall()
         
