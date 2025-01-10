@@ -8,9 +8,7 @@ from pypdf import PdfReader
 import io
 import ftfy
 import nltk
-from snowflake.snowpark.session import Session
-from snowflake.snowpark.context import get_active_session
-from snowflake.snowpark.functions import col
+
 from snowflake.core import Root
 
 # Add these constants at the top of the file
@@ -270,7 +268,7 @@ def search_documents(conn, query):
     """Search documents using Snowflake Cortex Search Service"""
     try:
         # Get Snowpark session and root
-        session = get_active_session()
+        session = st.session_state.snowflake_connection
         root = Root(session)
         
         # Get the search service

@@ -4,3 +4,4 @@ snowflake-snowpark-python
 pypdf==3.17.1
 ftfy==6.1.3
 nltk==3.8.1
+snowflake.core==1.1.0
