@@ -3,7 +3,7 @@ import snowflake.connector
 from snowflake.connector.errors import ProgrammingError
 import os
 from hashlib import sha256
-import PyPDF2
+import pypdf
 import io
 
 def init_snowflake_connection():
